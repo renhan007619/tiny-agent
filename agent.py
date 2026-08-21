@@ -67,6 +67,6 @@ class Mincore:
                 previous_response_id=response.id,
                 input=results,
             )
-            return response.id,response.output_text
+            return response.id,response.output_text #测试
 
     
