@@ -1,3 +1,4 @@
+# 最小 agent：裸调 API + tool calling 循环
 import random
 def get_color()->str:
     colors=["red","green","blue","yellow","purple","white","black"]
