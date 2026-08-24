@@ -1,73 +1,111 @@
-# 最小 agent：裸调 API + tool calling 循环
-import random
-def get_color()->str:
-    colors=["red","green","blue","yellow","purple","white","black"]
-    return random.choice(colors)
-def get_number()->int:
-    return random.randint(0,100)
-from function_schema import get_function_schema
-def make_schemas(funcs):
-    schemas=[]
-    for f in funcs:
-        schema=get_function_schema(f)
-        schema["type"]="function"
-        schemas.append(schema)
-    return schemas
-def make_function_map(funcs):
-    return{f._name_:f for f in funcs}
+import os
 import json
-def extract_calls(responce):
-    calls=[]
-    for item in getattr(responce,"output",None) or []:
-        name =getattr(item,"name",None)
-        args =getattr(item,"arguments",None)
-        if not name or args is None:
-            continue
-        if isinstance(args,str): 
-            try:
-                args = json.loads(args)
-            except Exception:
-                args =[]
-        calls.append({"id":getattr(item,"call.id","") or "","name":name,"args":args})
-    return calls
-from openai import OpenAI
-class Mincore:
-    def _init_ (self,api_key,model="gpt-4o-mini",system_prompt="You are a helpful assistant."):
-        self.client=OpenAI(api_key=api_key)
+import random
+from dotenv import load_dotenv
+from anthropic import Anthropic
+from function_schema import get_function_schema
+
+
+def get_color() -> str:
+    colors = ["red", "green", "blue", "yellow", "purple", "white", "black"]
+    return random.choice(colors)
+
+
+def get_number() -> int:
+    return random.randint(0, 100)
+
+
+def make_schemas(funcs):
+    """把函数列表转成 Anthropic 工具说明书（name/description/input_schema）。"""
+    return [get_function_schema(f) for f in funcs]
+
+
+def make_function_map(funcs):
+    return {f.__name__: f for f in funcs}
+
+
+class MinCore:
+    def __init__(self, api_key, base_url, model,
+                 system_prompt="You are a helpful assistant."):
+        self.client = Anthropic(api_key=api_key, base_url=base_url)
         self.model = model
         self.system_prompt = system_prompt
-        #初始化
-    def send_message(self,user_message,previous_response_id=None,funcs=(),max_rounds=5):
-        #第一次对话，建立对话
-        if previous_response_id is None:
-            r=self.client.response.create(
-                model:self.model
-                input=[{"role":"system","content":self.system_prompt}]
-            )
-            previous_response_id=r.id
-        schemas= make_schemas(funcs)
-        fn_map=make_function_map(funcs)
-        #发用户消息，带上说明书
-        response=self.client.response.create(
-            model=self.model,
-            previous_response_id=previous_response_id,
-            input=[{"role":"user","content":user_message}],
-            tools=schemas if funcs else None,
-        )
-        for _ in range (max_rounds):
-            calls=extract_calls(response)
-            if not calls:
-                break
-            results=[]
-            for c in calls:
-                result=fn_map[c["name"]](**c["args"]) #执行工具函数
-                output=json.dumps(result,default=str) if isinstance (result,(dict,list)) else str(result)
-                results.append({"type": "function_call_output","call_id":c["id"],"output":output})
-            response=self.client.responses.create(
-                model=self.model,
-                previous_response_id=response.id,
-                input=results,
-            )
-            return response.id,response.output_text #测试
+        self.max_tokens = 2048
 
-    
+    def send_message(self, user_message, history=None, funcs=(), max_rounds=5):
+        """发一条用户消息，自动执行工具调用循环，返回 (更新后的历史, 最终文本)。"""
+        schemas = make_schemas(funcs) if funcs else None
+        fn_map = make_function_map(funcs)
+
+        messages = history if history is not None else []
+        messages.append({"role": "user", "content": user_message})
+
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=self.max_tokens,
+            system=self.system_prompt,
+            messages=messages,
+            tools=schemas,
+        )
+
+        for _ in range(max_rounds):
+            tool_uses = [b for b in response.content if b.type == "tool_use"]
+            if not tool_uses:
+                break
+
+            # 助手这一轮的完整内容（含 tool_use）必须原样放回历史
+            messages.append({"role": "assistant", "content": response.content})
+
+            results = []
+            for b in tool_uses:
+                fn = fn_map.get(b.name)
+                if fn is None:
+                    output = f"unknown function: {b.name}"
+                else:
+                    result = fn(**b.input)  # 执行工具函数
+                    output = (json.dumps(result, default=str)
+                              if isinstance(result, (dict, list)) else str(result))
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": b.id,
+                    "content": output,
+                })
+            messages.append({"role": "user", "content": results})
+
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=self.max_tokens,
+                system=self.system_prompt,
+                messages=messages,
+                tools=schemas,
+            )
+
+        texts = [b.text for b in response.content if b.type == "text"]
+        return messages, "\n".join(texts)
+
+
+def main():
+    load_dotenv()
+    api_key = os.getenv("BAZ_OPENAI_API_KEY")
+    base_url = os.getenv(
+        "BAZ_OPENAI_BASE_URL",
+        "https://api.lkeap.cloud.tencent.com/plan/anthropic")
+    model = os.getenv("BAZ_OPENAI_MODEL", "deepseek-v4-flash-202605")
+    if not api_key:
+        raise ValueError("BAZ_OPENAI_API_KEY not set")
+
+    llm = MinCore(api_key=api_key, base_url=base_url, model=model,
+                  system_prompt=(
+                      "You are Baz. You have two tools: get_color and get_number. "
+                      "Use them when asked for colors or numbers."))
+    funcs = (get_color, get_number)
+
+    history = None
+    while True:
+        text = input("\n>>> You: ")
+        history, reply = llm.send_message(text, history=history, funcs=funcs)
+        print("\n>>> Agent:", reply)
+
+
+if __name__ == "__main__":
+    main()
