@@ -1,3 +1,4 @@
+# tiny-agent: 基于 Anthropic Messages API 的最小 agent 示例（tool_use/tool_result 循环）
 import os
 import json
 import random
