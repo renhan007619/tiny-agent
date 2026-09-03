@@ -7,3 +7,6 @@ __pycache__/
 .gopath/
 .gobuild/
 *.exe
+
+# SQLite 运行时数据与测试残留库不入库
+*.db
