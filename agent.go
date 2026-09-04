@@ -63,14 +63,19 @@ func (m *MinCore) apiTools(tools []*Tool) []anthropic.ToolUnionParam {
 }
 
 // callModel 一次 Messages API 调用。
-func (m *MinCore) callModel(ctx context.Context, messages []anthropic.MessageParam, apiTools []anthropic.ToolUnionParam) (*anthropic.Message, error) {
+func (m *MinCore) callModel(ctx context.Context, messages []anthropic.MessageParam, apiTools []anthropic.ToolUnionParam, systemExtra string) (*anthropic.Message, error) {
 	params := anthropic.MessageNewParams{
 		Model:     anthropic.Model(m.model),
 		MaxTokens: m.maxTokens,
 		Messages:  messages,
 	}
-	if m.systemPrompt != "" {
-		params.System = []anthropic.TextBlockParam{{Text: m.systemPrompt}}
+	fullSystem := m.systemPrompt
+	if systemExtra != "" {
+		fullSystem += "\n\n" + systemExtra
+	}
+
+	if fullSystem != "" {
+		params.System = []anthropic.TextBlockParam{{Text: fullSystem}}
 	}
 	if len(apiTools) > 0 {
 		params.Tools = apiTools
@@ -107,7 +112,7 @@ func assistantContent(content []anthropic.ContentBlockUnion) []anthropic.Content
 //
 // 返回：(更新后的历史, 最终文本)
 // 调用方要把"更新后的历史"存好，下次再传回来，任务状态才延续。
-func (m *MinCore) SendMessage(ctx context.Context, userMessage string, history []anthropic.MessageParam, tools []*Tool, maxRounds int) ([]anthropic.MessageParam, string, error) {
+func (m *MinCore) SendMessage(ctx context.Context, userMessage string, history []anthropic.MessageParam, tools []*Tool, maxRounds int, systemExtra string) ([]anthropic.MessageParam, string, error) {
 	// 本次请求的工具说明书只生成一次（对应 Python: schemas = make_schemas(funcs)）
 	schemas := m.apiTools(tools)
 
@@ -124,7 +129,7 @@ func (m *MinCore) SendMessage(ctx context.Context, userMessage string, history [
 	// --- 工具循环：最多 maxRounds 轮 ---
 	for range maxRounds {
 		// 1) 调模型
-		resp, err := m.callModel(ctx, messages, schemas)
+		resp, err := m.callModel(ctx, messages, schemas, systemExtra)
 		if err != nil {
 			return messages, "", err
 		}

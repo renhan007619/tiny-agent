@@ -47,7 +47,7 @@ func TestToolLoop(t *testing.T) {
 		t.Log("Q:", q)
 		var reply string
 		var err error
-		history, reply, err = llm.SendMessage(ctx, q, history, tools, 5)
+		history, reply, err = llm.SendMessage(ctx, q, history, tools, 5, "")
 		if err != nil {
 			t.Fatalf("SendMessage(%q): %v", q, err)
 		}
