@@ -10,6 +10,11 @@ import (
 	"github.com/anthropics/anthropic-sdk-go"
 )
 
+// 滑动窗口预算（按公式推导，假设窗口 128k）：输出预留 2048×6≈12k，
+// 工具结果+system+本轮输入≈3k，再留安全余量 → ~90000。
+// 若真实跑长对话报 context 超限，把此值调小一档即可。
+const historyBudgetTokens = 90000
+
 // ============ 4. main：命令行 REPL（对话入口） ============
 //
 // 对应 agent.py 第 4 块（main 函数）。整体结构从上到下 4 块：
@@ -66,9 +71,11 @@ func main() {
 		}
 		text := scanner.Text()
 		// 传回 history（短期记忆），拿回更新后的 history 和回答
+		history = TrimHistory(history, historyBudgetTokens)
 		systemExtra := ""
 		if hits, serr := store.Search(text, 3); serr == nil && len(hits) > 0 {
-			systemExtra = "相关记忆：\n" + strings.Join(hits, "\n")
+			systemExtra = "相关记忆: \n" + strings.Join(hits, "\n")
+
 		}
 		var reply string
 		var err error
