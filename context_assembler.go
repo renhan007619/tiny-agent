@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/anthropics/anthropic-sdk-go"
 )
@@ -143,4 +144,168 @@ func (r AssembleReport) String() string {
 		fmt.Fprintf(&sb, "\n  ! %s", w)
 	}
 	return sb.String()
+}
+
+//3) 装配：记账按优先级，排列按稳定性
+
+type AssembleInput struct {
+	BaseSystem  string                     // 稳定系统指令（MinCore.systemPrompt）
+	MemoryHits  []string                   // 长期记忆命中，按相关度降序
+	History     []anthropic.MessageParam   // 历史对话（不含本轮输入）
+	UserInput   string                     // 本轮用户输入
+	Tools       []anthropic.ToolUnionParam // 工具说明书（口径 = 实际发出去的那份）
+	Budget      Budget
+	EnableCache bool // 是否在稳定块打 cache_control 断点（默认关，理由见下）
+}
+
+// Assembled 装配结果：直接喂给 Messages API 的三样东西 + 一份账。
+type Assembled struct {
+	System   []anthropic.TextBlockParam
+	Messages []anthropic.MessageParam
+	Tools    []anthropic.ToolUnionParam
+	Report   AssembleReport
+}
+
+const memoryHead = "相关记忆: \n"
+
+// AssembleContext 装配一次请求的上下文。纯函数：同样输入必得同样输出。
+//
+// 记账顺序 = 优先级（固定段 > 记忆段 > history 吃剩余）；
+// 排列顺序 = 稳定性（稳定在前、易变垫底）。两条轴独立。
+func AssembleContext(in AssembleInput) Assembled {
+	b := in.Budget
+	rep := AssembleReport{Window: b.Window, OutputReserve: b.outputReserve(), Available: b.available()}
+	if rep.Available <= 0 {
+		rep.warn("窗口 %d 覆盖不了输出预留 %d + 余量，预算配置有误", b.Window, rep.OutputReserve)
+	}
+
+	// --- 记账 1：固定段（不可裁，只能如实上报） ---
+	toolsUsed := estimateToolsTokens(in.Tools)
+	sysUsed := estimateTextTokens(in.BaseSystem)
+	rep.addSection("tools", toolsUsed, toolsUsed, false)
+	rep.addSection("system(稳定)", sysUsed, sysUsed, false)
+
+	// --- 记账 2：记忆段（可裁：先丢整条，再截断） ---
+	memText, memUsed, memTrimmed := fitMemory(in.MemoryHits, b.MemoryMaxTokens)
+	rep.addSection("system(记忆)", memUsed, b.MemoryMaxTokens, memTrimmed)
+	if len(in.MemoryHits) > 0 && memText == "" {
+		rep.warn("命中 %d 条记忆但一条都放不下（MemoryMaxTokens=%d 过小）", len(in.MemoryHits), b.MemoryMaxTokens)
+	}
+
+	// --- 记账 3：messages 吃剩余（本轮输入先保证，history 吃剩下） ---
+	msgBudget := rep.Available - toolsUsed - sysUsed - memUsed
+	if msgBudget < 0 {
+		rep.warn("固定段(tools+system+记忆)已用 %d，超出可用预算 %d，history 只能保留最新一轮",
+			toolsUsed+sysUsed+memUsed, rep.Available)
+		msgBudget = 0
+	}
+	userUsed := estimateTextTokens(in.UserInput)
+	histBudget := msgBudget - userUsed
+	if histBudget < 0 {
+		histBudget = 0
+	}
+	history := TrimHistory(in.History, histBudget)
+	histUsed := historyTokensOf(history)
+	rep.addSection("history", histUsed, histBudget, len(history) < len(in.History))
+	rep.addSection("user(本轮)", userUsed, userUsed, false)
+
+	if histBudget > 0 && histUsed > histBudget {
+		rep.warn("history 裁到只剩最新一轮仍占 %d > 预算 %d（TrimHistory 底线：宁超不切半轮）",
+			histUsed, histBudget)
+	}
+	if len(history) < len(in.History) {
+		// 裁剪位置 = 前缀失效位置。缓存匹配的是"字节流的开头"：从头部删一轮，
+		// 后面所有轮次整体前移、位置全变，messages 段缓存需重建。这条告警
+		// 是"缓存省了多少"的唯一线索，也是将来做滞后裁剪（超到 110% 才裁回
+		// 90%，用可控超额换裁剪频率下降）的观测依据。
+		rep.warn("history 从头部裁掉 %d 条消息 -> messages 前缀变化，prompt cache 需重建",
+			len(in.History)-len(history))
+	}
+
+	// --- 排列：稳定在前，易变垫底 ---
+	var system []anthropic.TextBlockParam
+	if in.BaseSystem != "" {
+		blk := anthropic.TextBlockParam{Text: in.BaseSystem}
+		if in.EnableCache {
+			// 断点打在"最后一个稳定 block"上：Anthropic 的缓存是
+			// tools -> system -> messages 的连续前缀，断点表示"到此（含 tools）可缓存"。
+			// 为什么默认关（两个现实）：① 官方要求前缀达到最小长度（1024/2048 token）
+			// 才真写入缓存，我们这点 system 远不够；② 记忆块每轮变化，杀伤半径
+			// 不止自己——它之后整个 messages 的缓存都陪葬。真正的修复（记忆挪
+			// messages 尾部 / 会话内冻结记忆）属于路线图"缓存友好布局"。
+			// 这里只保证结构正确：实测条件满足后可随时打开。
+			blk.CacheControl = anthropic.CacheControlEphemeralParam{}
+		}
+		system = append(system, blk)
+	}
+	if memText != "" {
+		// 每轮变化的记忆垫底：旧版拼进同一个 block，等于让稳定部分陪着失效。
+		system = append(system, anthropic.TextBlockParam{Text: memText})
+	}
+
+	// 不复用 history 的底层数组：append 会写进共享数组的容量区，与调用方
+	// 持有的旧切片形成别名，这类 bug 调试时极难发现。
+	messages := make([]anthropic.MessageParam, 0, len(history)+1)
+	messages = append(messages, history...)
+	messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(in.UserInput)))
+
+	rep.TotalUsed = toolsUsed + sysUsed + memUsed + histUsed + userUsed
+	return Assembled{System: system, Messages: messages, Tools: in.Tools, Report: rep}
+}
+
+// fitMemory 把记忆命中控量后拼成一段文本。
+//
+// 策略（为什么这么做）：每条命中是一整条独立事实，直接按字节砍尾巴会把最后
+// 一条砍成残句，模型很可能把残句当完整事实（"用户在腾讯云工作"→"用户在腾讯"）。
+// 所以：按相关度降序收，放不下就丢整条并停止（后面的更不相关，一并丢）；
+// 一条都放不下时，才截断第一条——宁要残句，也不要把记忆整段丢空。
+func fitMemory(hits []string, maxTokens int) (text string, used int, trimmed bool) {
+	headUsed := estimateTextTokens(memoryHead)
+	if len(hits) == 0 || maxTokens <= headUsed {
+		return "", 0, false
+	}
+	used = headUsed
+	kept := make([]string, 0, len(hits))
+	for _, h := range hits {
+		if h == "" {
+			continue
+		}
+		cost := estimateTextTokens(h) + 1 // +1 = join 时的换行
+		if used+cost > maxTokens {
+			trimmed = true
+			if len(kept) == 0 { // 连第一条都放不下 -> 截断它
+				tr := truncateByTokens(h, maxTokens-used)
+				kept = append(kept, tr)
+				used = headUsed + estimateTextTokens(tr) + 1
+				if used > maxTokens {
+					used = maxTokens // 省略号"…"3字节可能让估算回弹，保守记账
+				}
+			}
+			break
+		}
+		kept = append(kept, h)
+		used += cost
+	}
+	if len(kept) == 0 {
+		return "", 0, trimmed
+	}
+	return memoryHead + strings.Join(kept, "\n"), used, trimmed
+}
+
+// truncateByTokens 按估算口径反向截断。
+// 口径是 len(s)/3，所以 n token ≈ 3n 字节；从边界往前退到合法 UTF-8 字符起点，
+// 免得把中文切出半个字符（无效字节会让 JSON 编码和模型输入都出问题）。
+func truncateByTokens(s string, tokens int) string {
+	if tokens <= 0 {
+		return ""
+	}
+	maxBytes := tokens * 3
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
 }
