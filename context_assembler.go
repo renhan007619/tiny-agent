@@ -111,6 +111,7 @@ type AssembleReport struct { //总账单
 	Window        int             // 模型窗口总量（全局：这次预算是从多大池子里分的）
 	OutputReserve int             // 给模型输出预留了多少
 	Available     int             //扣完硬开销后，能装内容的总量
+	MessageBudget int             // messages 段配额（含本轮输入）= Available − tools − system − 记忆
 	Sections      []SectionReport //每个槽位一个小票
 	TotalUsed     int             //总用的token
 	Warnings      []string        // 装配期异常（固定段超预算、history 前缀失效、工具循环撑爆等）
@@ -199,6 +200,9 @@ func AssembleContext(in AssembleInput) Assembled {
 			toolsUsed+sysUsed+memUsed, rep.Available)
 		msgBudget = 0
 	}
+	// 必须在 clamp 之后入账：记 clamp 前的负数会让 agent.go 工具循环那道
+	// "messages 有没有涨破配额"的护栏失真，护栏等于没有。
+	rep.MessageBudget = msgBudget
 	userUsed := estimateTextTokens(in.UserInput)
 	histBudget := msgBudget - userUsed
 	if histBudget < 0 {

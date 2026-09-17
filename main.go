@@ -101,7 +101,7 @@ func main() {
 		}
 
 		// --- 长期记忆 · 写入（对话后） ---
-		if aerr := store.Add("Q: " + text + " A: " + reply); aerr != nil {
+		if aerr := store.Add("Q: " + text + " A: " + res.Reply); aerr != nil {
 			fmt.Fprintln(os.Stderr, ">>> 记忆写入失败:", aerr)
 		}
 	}

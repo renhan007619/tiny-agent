@@ -5,6 +5,7 @@ __pycache__/
 
 # Go（本机沙箱把 GOPATH/GOCACHE 指到工作区产生的缓存目录）
 .gopath/
+.gocache/
 .gobuild/
 *.exe
 
