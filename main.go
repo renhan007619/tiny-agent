@@ -1,3 +1,4 @@
+// tiny-agent：最小可用 Agent 的 Go 实现（工具调用 + 短期记忆 + 上下文装配预算）。
 package main
 
 import (
