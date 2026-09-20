@@ -313,3 +313,39 @@ func truncateByTokens(s string, tokens int) string {
 	}
 	return s[:cut] + "…"
 }
+
+// toolResultQuota 本轮每个工具结果的配额：本轮总预留按调用数均分。
+func toolResultQuota(reserve, n int) int {
+	if n <= 1 {
+		return reserve
+	}
+	q := reserve / n
+	if q < 1 {
+		q = 1 // 防御下限：一轮几百个调用时也别把结果削成空串
+	}
+	return q
+}
+
+const toolResultMarkerFmt = "\n…[已截断：原始约 %d token，单条上限 %d token]"
+
+// truncateToolResult 按配额截断一条工具结果（L0：零 LLM 成本的尺寸闸门）。
+func truncateToolResult(text string, maxTokens int) (string, bool) {
+	used := estimateTextTokens(text)
+	if used <= maxTokens {
+		return text, false
+	}
+	if maxTokens <= 0 {
+		return "", true // 配额非正：等于全丢，但必须返回 true 让调用方留痕
+	}
+	marker := fmt.Sprintf(toolResultMarkerFmt, used, maxTokens)
+	// 正文额度 = 配额 − 标记自身开销 − 2：
+	//   1 给 truncateByTokens 自己追加的省略号（fitMemory 踩过同样的回弹坑）；
+	//   1 给"字节/3"在边界上的估算回弹（1443 字节 + '…' 会被估成 483 > 481）。
+	// 宁可少削 2 token，也不让"削完仍超配额"这种账本与闸门不同源的事发生——
+	// 下面的测试就是钉住这个承诺的。
+	bodyTokens := maxTokens - estimateTextTokens(marker) - 2
+	if bodyTokens < 0 {
+		bodyTokens = 0
+	}
+	return truncateByTokens(text, bodyTokens) + marker, true
+}
