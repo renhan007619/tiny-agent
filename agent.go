@@ -219,7 +219,8 @@ func (m *MinCore) SendMessage(ctx context.Context, req SendRequest) (SendResult,
 		// 4) 短期记忆写入（2/3）：助手这轮完整内容原样放回历史
 		messages = append(messages, anthropic.NewAssistantMessage(assistantContent(resp.Content)...))
 
-		// 5) 逐个执行模型请求的工具
+		// 5) 逐个执行模型请求的工具//26920 l0 工具token截断处理
+		quota := toolResultQuota(req.Budget.ToolResultReserve, len(calls))
 		var results []anthropic.ContentBlockParamUnion
 		for _, c := range calls {
 			tool := fnMap[c.name]
@@ -229,13 +230,19 @@ func (m *MinCore) SendMessage(ctx context.Context, req SendRequest) (SendResult,
 				results = append(results, anthropic.NewToolResultBlock(c.id, "unknown function: "+c.name, true))
 				continue
 			}
-			out, execErr := tool.execute(c.input)
-			if execErr != nil {
-				results = append(results, anthropic.NewToolResultBlock(c.id, "tool error: "+execErr.Error(), true))
-				continue
+			raw := stringify(out)
+			text, cut := truncateToolResult(raw, quota)
+			if cut {
+				// 截断必须留痕：静默截断等于数据损坏，模型和人都该知道这条不完整。
+				// 与工具循环护栏同一待遇（进报告 + 打 stderr），理由也一样——
+				// 只写在报告里、没开 TINY_AGENT_DEBUG_CONTEXT 就完全静默。
+				msg := fmt.Sprintf("工具 %s 结果约 %d token，超单条配额 %d，已截断（原始内容不可恢复，需完整内容请走外置+召回）",
+					c.name, estimateTextTokens(raw), quota)
+				res.Context.Warnings = append(res.Context.Warnings, msg)
+				fmt.Fprintln(os.Stderr, ">>> warning:", msg)
 			}
 			// 每个工具调用都要有对应的 tool_result，用 tool_use_id 关联
-			results = append(results, anthropic.NewToolResultBlock(c.id, stringify(out), false))
+			results = append(results, anthropic.NewToolResultBlock(c.id, text, false))
 		}
 
 		// 6) 短期记忆写入（3/3）：工具结果回填
