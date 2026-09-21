@@ -50,6 +50,8 @@ func NewMinCore(apiKey, baseURL, model, systemPrompt string) *MinCore {
 func (m *MinCore) apiTools(tools []*Tool) []anthropic.ToolUnionParam {
 	api := make([]anthropic.ToolUnionParam, 0, len(tools))
 	for _, t := range tools {
+		// Schema 由 tools.go 自己构造、结构已知：断言失败只会得到 nil 映射/切片，
+		// 效果等价于"这个工具没有参数"，所以第二个返回值可以安全忽略。
 		props, _ := t.Schema["properties"].(map[string]any)
 		req, _ := t.Schema["required"].([]string)
 		api = append(api, anthropic.ToolUnionParam{OfTool: &anthropic.ToolParam{
@@ -219,7 +221,8 @@ func (m *MinCore) SendMessage(ctx context.Context, req SendRequest) (SendResult,
 		// 4) 短期记忆写入（2/3）：助手这轮完整内容原样放回历史
 		messages = append(messages, anthropic.NewAssistantMessage(assistantContent(resp.Content)...))
 
-		// 5) 逐个执行模型请求的工具//26920 l0 工具token截断处理
+		// 5) 逐个执行模型请求的工具
+		// 26年9月20日 起：超长结果按配额截断（L0，零 LLM 成本）
 		quota := toolResultQuota(req.Budget.ToolResultReserve, len(calls))
 		var results []anthropic.ContentBlockParamUnion
 		for _, c := range calls {
@@ -228,6 +231,13 @@ func (m *MinCore) SendMessage(ctx context.Context, req SendRequest) (SendResult,
 				// 模型要求了不存在的工具（幻觉/名字写错）——明确报错并标 is_error，
 				// 让模型知道自己错了（比 Python 版只回文本更严谨的一处）
 				results = append(results, anthropic.NewToolResultBlock(c.id, "unknown function: "+c.name, true))
+				continue
+			}
+			// 真正执行工具。注意这两步不能省：没有 execute，模型永远收不到工具结果；
+			// 执行失败也必须回一条 is_error 的 tool_result，否则这次调用会悬空。
+			out, execErr := tool.execute(c.input)
+			if execErr != nil {
+				results = append(results, anthropic.NewToolResultBlock(c.id, "tool error: "+execErr.Error(), true))
 				continue
 			}
 			raw := stringify(out)
