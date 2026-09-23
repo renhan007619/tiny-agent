@@ -6,6 +6,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// 本文件负责长期记忆的持久化：SQLite 建表 + 写入 / 查询。
 // Store 长期记忆库：先弄一个仓库
 type Store struct {
 	db *sql.DB
