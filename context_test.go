@@ -135,13 +135,18 @@ func turnCount(h []anthropic.MessageParam) int {
 }
 
 // checkInvariants 是滑动窗口的"合同"：任何输入、任何预算，输出都必须满足。
+//
+// 每条不变式都打 ✓/✗：带 -v 跑时，输出是一份"逐条对账"的清单，
+// 而不是只有一个光秃秃的 PASS（go test 默认不打印通过的测试）。
+//   go test -v .
 func checkInvariants(t *testing.T, in, out []anthropic.MessageParam, budget int) {
 	t.Helper()
 
 	// ① 非空：宁可超预算，也不把最新一轮切没
 	if len(out) == 0 {
-		t.Fatal("不变式①：结果为空 —— 底线是永不丢最新一轮")
+		t.Fatal("✗ 不变式①：结果为空 —— 底线是永不丢最新一轮")
 	}
+	t.Logf("✓ 不变式① 非空：保留 %d 条 / 输入 %d 条", len(out), len(in))
 
 	// ② 裁剪后首条必须是新一轮提问；没裁剪（长度没变）时不做要求
 	if len(out) < len(in) && !isNewUserTurn(out[0]) {
@@ -149,28 +154,45 @@ func checkInvariants(t *testing.T, in, out []anthropic.MessageParam, budget int)
 		for _, b := range out[0].Content {
 			types = append(types, blockType(b))
 		}
-		t.Errorf("不变式②：裁剪切在了轮中间，首条不是新一轮提问（role=%s, blocks=%v）",
+		t.Errorf("✗ 不变式②：裁剪切在了轮中间，首条不是新一轮提问（role=%s, blocks=%v）",
 			out[0].Role, types)
+	} else if len(out) < len(in) {
+		t.Logf("✓ 不变式② 裁剪后首条是新一轮提问：%q（从头部裁掉 %d 条）",
+			firstText(out[0]), len(in)-len(out))
+	} else {
+		t.Logf("✓ 不变式② 未裁剪，输入原样保留（%d 条）", len(out))
 	}
 
 	// ③ tool_use / tool_result 必须成对
 	uses, results := collectToolIDs(out)
+	broken := false
 	for id := range uses {
 		if !results[id] {
-			t.Errorf("不变式③：tool_use %q 丢了配对的 tool_result", id)
+			t.Errorf("✗ 不变式③：tool_use %q 丢了配对的 tool_result", id)
+			broken = true
 		}
 	}
 	for id := range results {
 		if !uses[id] {
-			t.Errorf("不变式③：tool_result %q 丢了配对的 tool_use", id)
+			t.Errorf("✗ 不变式③：tool_result %q 丢了配对的 tool_use", id)
+			broken = true
 		}
+	}
+	if !broken {
+		t.Logf("✓ 不变式③ tool 对未拆散：%d 组", len(uses))
 	}
 
 	// ④ 闭环：要么已经回到预算内，要么已经退到只剩最新一轮（后者允许超预算）。
 	// 只断言 total <= budget 会在"只剩一轮但仍超预算"这个合法分支上误报；
 	// 只断言"只剩一轮"又漏掉本该继续丢却没丢的 bug。
-	if total := totalTokens(out); total > budget && turnCount(out) != 1 {
-		t.Errorf("不变式④：total=%d 超预算 %d，却又不止一轮（未退到底线）", total, budget)
+	total := totalTokens(out)
+	turns := turnCount(out)
+	if total > budget && turns != 1 {
+		t.Errorf("✗ 不变式④：total=%d 超预算 %d，却又不止一轮（%d 轮，未退到底线）", total, budget, turns)
+	} else if total > budget {
+		t.Logf("✓ 不变式④ 已退到底线：total=%d 超预算 %d，但只剩 1 轮（合法分支）", total, budget)
+	} else {
+		t.Logf("✓ 不变式④ 回到预算内：total=%d ≤ budget=%d", total, budget)
 	}
 }
 

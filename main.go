@@ -41,12 +41,21 @@ func main() {
 		apiKey,
 		baseURL,
 		model,
-		"You are Baz. You have two tools: get_color and get_number. "+
-			"Use them when asked for colors or numbers.",
+		// 加工具必须同步改这里：模型只从 system prompt 和 tools schema 知道
+		// 自己有什么能力。只加 tools 不改 prompt，模型不会主动去用它——
+		// 这是一处隐性耦合，加/删工具时最容易漏。
+		"You are Baz. Tools: get_color, get_number, read_file. "+
+			"Use read_file when the user asks about a file's content. "+
+			"Large results are truncated and marked; tell the user when you see a truncation marker.",
 	)
+	// 工具名用 snake_case：Go 函数名读出来是 camelCase（readFile），
+	// 但工具名是给模型看的，snake_case 是生态惯例（Anthropic 官方示例也这么写）。
+	readFileTool := newTool(readFile, "读取工作目录内的文本文件，返回全文；超大结果会被截断")
+	readFileTool.Name = "read_file"
 	tools := []*Tool{
 		newTool(getColor, "随机返回一个颜色"),
 		newTool(getNumber, "随机返回 0-100 的整数"),
+		readFileTool,
 	}
 	budget := DefaultBudget()
 	store, err := NewStore("memory.db")
