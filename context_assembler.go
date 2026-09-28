@@ -238,7 +238,10 @@ func AssembleContext(in AssembleInput) Assembled {
 			// 不止自己——它之后整个 messages 的缓存都陪葬。真正的修复（记忆挪
 			// messages 尾部 / 会话内冻结记忆）属于路线图"缓存友好布局"。
 			// 这里只保证结构正确：实测条件满足后可随时打开。
-			blk.CacheControl = anthropic.CacheControlEphemeralParam{}
+			// 必须用构造函数、不能用零值构造：Type 是常量 "ephemeral"，
+			// 零值构造出来 Type=""，发出去要么被 API 判非法断点、要么断点静默失效
+			// （context_assembler_test.go 的 TestAssembleStablePrefixFirst 钉住这一点）。
+			blk.CacheControl = anthropic.NewCacheControlEphemeralParam()
 		}
 		system = append(system, blk)
 	}
