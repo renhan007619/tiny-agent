@@ -89,5 +89,57 @@ func (s *Skiplist) Delete(key int){
 	if dif>0{
 		s.head.nexts=s.head.nexts[:len(s.head.nexts)-dif]
 	}
+}
 
+func (s *Skiplist) ceiling(target int)*node{
+	move:=s.head
+	for level:=len(move.nexts)-1;level>=0;level--{
+		for move.nexts[level]!=nil && move.nexts[level].key<target{
+			move=move.nexts[level]
+		}
+		if move.nexts[level]!=nil && move.nexts[level].key==target{
+			return move.nexts[level]
+		}
+	}
+	return move.nexts[0]
+}
+
+func (s *Skiplist) Ceiling(target int) ([2]int,bool){
+	if ceilNode:=s.ceiling(target);ceilNode!=nil{
+		return [2]{ceilNode.key,ceilNode.val},true
+	}
+	return [2]int{},false
+}
+
+func (s *Skiplist) floor(target int) *node {
+	move := s.head
+	for level := len(s.head.nexts) - 1; level >= 0; level-- {
+		for move.nexts[level] != nil && move.nexts[level].key < target {
+			move = move.nexts[level]
+		}
+		if move.nexts[level] != nil && move.nexts[level].key == target {
+			return move.nexts[level]
+		}
+	}
+	return move
+}
+
+func(s *Skiplist) Floor (target int) ([2]int,bool){
+	floorNode := s.floor(target)
+	if floorNode==s.head{
+		return [2]int{},false
+	}
+	return [2]int{floorNode.key,floorNode.Val},true
+}
+
+func (s *Skiplist) range(start,end int) [][2]int{
+	ceilNode:=s.ceiling(start)
+	if ceilNode==nil{
+		return [][2]int{}
+	}
+	var res [][2]int
+	for move:=ceilNode;move!=nil && move.key<=end;move=move.nexts[0]{
+		res=append(res,[2]int{move.key,move.Val})
+	}
+	return res
 }
