@@ -166,3 +166,129 @@ func (s *ResultStore) writeMeta(m resultMeta) error {
 	}
 	return nil
 }
+// Read 按行窗口读回全文。offset 从 1 开始。
+//
+// 两个闸门叠在一起：行数（limit / maxRecallLines）+ token（pageTokens）。
+// 少了后者，召回结果自己又会被外层闸门再外置一次（套娃：为了读一个外置
+// 结果，又产生一个新的外置结果）。
+func (s *ResultStore) Read(handle string, offset, limit int) (string, error) {
+	// 只在取 meta 时持锁，读文件在锁外：否则一次大文件读取会卡住所有 Save。
+	// 这里的 meta 是值拷贝，出了临界区就与索引脱钩，不会被并发修改影响。
+	s.mu.Lock()
+	meta, ok := s.byHandle[handle]
+	s.mu.Unlock()
+
+	if !ok {
+		// 关键：失败必须"吵"，绝不能返回空字符串。
+		// 返回空的后果是模型以为"这个文件是空的"，然后基于"空"继续推理——
+		// 静默的空内容是外置类功能最危险的失败形态。
+		// 顺带把可用句柄列出来，给模型一个自我纠正的抓手。
+		return "", fmt.Errorf("句柄 %q 无效或已过期；本会话可用句柄：%s", handle, s.knownHandles())
+	}
+
+	f, err := os.Open(filepath.Join(s.sessionDir(), meta.File))
+	if err != nil {
+		// 索引在但文件没了 = 被 GC 或被人工删了：同样要明确报，不能静默
+		return "", fmt.Errorf("打开外置结果失败（文件可能已被清理）: %w", err)
+	}
+	defer f.Close()
+
+	// ---- 参数 clamp：模型给的参数不可信，一律夹到合法区间 ----
+	// offset 从 1 开始是刻意的：页眉要给模型看"第 1-100 行 / 共 812 行"，
+	// 人类和模型的直觉都是 1-based，内部换算只保留这一处。
+	if offset < 1 {
+		offset = 1
+	}
+	if limit <= 0 {
+		limit = maxRecallLines
+	}
+	if limit > maxRecallLines {
+		limit = maxRecallLines
+	}
+
+	// 页眉页脚也要占额度，所以正文只给 3/4。
+	// 这是经验值，但方向是确定的：凡是"返回结果自带包装"的地方，
+	// 都必须先给包装留出额度，否则又会造出"召回一页反而超配额"的新洞。
+	bodyBudget := s.pageTokens * 3 / 4
+
+	var sb strings.Builder
+	used, lineNo, kept := 0, 0, 0
+
+	// 按行读：日志/JSON/CSV 都是行结构化的，按行切每页自成语义单元；
+	// 按字节切会把一行 JSON 拦腰砍断，模型拿到半行反而更容易幻觉。
+	sc := bufio.NewScanner(f)
+	// 初始 64KB、上限 8MB：单行可能是超大 JSON。超过 8MB 会 Scan 报错，
+	// 那是这条记录形态超出工具能力边界，宁可报错也不静默丢内容。
+	sc.Buffer(make([]byte, 0, 64<<10), 8<<20)
+
+	for sc.Scan() {
+		lineNo++
+		if lineNo < offset {
+			continue // 跳过的行不占额度，只花 CPU
+		}
+		if kept >= limit {
+			break // 行数闸门先到
+		}
+		line := sc.Text()
+		cost := estimateTextTokens(line) + 1 // +1 = 换行
+
+		// 单行本身就超预算：截断这一行也要给。绝不能返回空——
+		// 模型至少要看到"这里有内容、但一行太长"。
+		if kept == 0 && cost > bodyBudget {
+			sb.WriteString(truncateByTokens(line, bodyBudget))
+			sb.WriteByte('\n')
+			kept = 1
+			break
+		}
+		// token 闸门：宁可少给几行，也不能超过 pageTokens——
+		// 超了就会触发套娃外置（见函数头注释）。
+		if kept > 0 && used+cost > bodyBudget {
+			break
+		}
+		sb.WriteString(line)
+		sb.WriteByte('\n')
+		used += cost
+		kept++
+	}
+	if err := sc.Err(); err != nil {
+		return "", fmt.Errorf("读取外置结果失败: %w", err)
+	}
+
+	if kept == 0 {
+		// offset 超出总行数：这不是错误，是"你翻过头了"，如实告知即可。
+		// 报 error 会让模型以为工具坏了，可能放弃继续读。
+		return fmt.Sprintf("[read_result] 句柄 %s 共 %d 行，offset=%d 超出范围", handle, meta.Lines, offset), nil
+	}
+
+	// 页眉要回答模型接下来一定会问的三个问题：这是谁、一共多少、我现在看到哪。
+	head := fmt.Sprintf("[read_result] 句柄 %s（源 %s，共 %d 行 / 约 %d token，已外置未计入历史）\n第 %d-%d 行：\n",
+		handle, meta.Tool, meta.Lines, meta.Tokens, offset, offset+kept-1)
+
+	// 页脚把"下一页怎么读"写成**可直接抄的完整调用**。
+	// 模型不会自己算 offset，也不会记得句柄格式；写"可以继续读"几乎无效，
+	// 写 read_result(handle="res-3", offset=101, limit=100) 才有效。
+	if next := offset + kept; next <= meta.Lines {
+		return head + sb.String() + fmt.Sprintf("\n[还有更多：read_result(handle=%q, offset=%d, limit=%d) 继续读]",
+			handle, next, limit), nil
+	}
+	return head + sb.String() + "\n[已到文件末尾]", nil
+}
+// readResultArgs read_result 的入参。
+// 字段名即模型要填的参数名（schema.go 的 functionSchema 直接读 json tag 和
+// description tag 生成 input_schema），所以 tag 是"给模型看的文档"。
+type readResultArgs struct {
+	Handle string `json:"handle" description:"外置结果句柄，形如 res-3，来自截断标记里的“句柄 res-3”"`
+	// 为什么描述里非写"读开头就填 1"：schema.go 的 functionSchema 有个硬约束——
+	// Go 参数没有默认值，所有字段都进 required。模型**不可能**省略 offset 让我们
+	// 兜底，所以只能把默认语义写进描述，代码里再 clamp。这是"schema 表达力不足
+	// 时，把默认值下沉到实现 + 文档"的标准处理。
+	Offset int `json:"offset" description:"起始行号，从 1 开始；读开头就填 1"`
+	Limit  int `json:"limit" description:"本次读取的行数上限（1-400），实际还会受 token 闸门收窄"`
+}
+
+// ReadResult 工具入口：方法值直接交给 newTool 注册。
+// 注意 newTool 从函数名推出来的是 "ReadResult"（方法值拿不到小写名），
+// 所以 main.go 里必须像 read_file 一样显式覆盖 Name = "read_result"。
+func (s *ResultStore) ReadResult(args readResultArgs) (string, error) {
+	return s.Read(args.Handle, args.Offset, args.Limit)
+}
