@@ -106,15 +106,32 @@ type SectionReport struct { //每个部分一张小票
 	Trimmed bool   //有没有因为超预算被裁过
 }
 
+// ExternalizedReport 一条"落盘了、但没进上下文"的记录（路线③ 外置 + 按 ID 召回）。
+//
+// 为什么必须单列：09-26 那次实测暴露的盲区就是这个——账本实占 282 token，
+// 实际丢掉了 20649 token，没有任何数字记录，事后回答不了"到底丢了多少"。
+//
+// 外置之后，"丢"变成了"换个地方存"，账本必须能同时回答两个问题：
+//  1. 这轮发出去多少     -> TotalUsed
+//  2. 多少内容被移出窗口 -> Externalized
+//
+// 两者是"无损转移"而不是"损失"的关系——但只有记下来才能证明这一点。
+type ExternalizedReport struct {
+	Tool   string // 来源工具：出问题时第一眼要知道是谁产出的
+	Handle string // 句柄：能直接拿去复现，也能人工核验落盘文件
+	Tokens int    // 落盘内容的估算 token（口径同 estimateTextTokens，是估算）
+}
+
 // AssembleReport 一次装配的完整账本。
 type AssembleReport struct { //总账单
-	Window        int             // 模型窗口总量（全局：这次预算是从多大池子里分的）
-	OutputReserve int             // 给模型输出预留了多少
-	Available     int             //扣完硬开销后，能装内容的总量
-	MessageBudget int             // messages 段配额（含本轮输入）= Available − tools − system − 记忆
-	Sections      []SectionReport //每个槽位一个小票
-	TotalUsed     int             //总用的token
-	Warnings      []string        // 装配期异常（固定段超预算、history 前缀失效、工具循环撑爆等）
+	Window        int                  // 模型窗口总量（全局：这次预算是从多大池子里分的）
+	OutputReserve int                  // 给模型输出预留了多少
+	Available     int                  //扣完硬开销后，能装内容的总量
+	MessageBudget int                  // messages 段配额（含本轮输入）= Available − tools − system − 记忆
+	Sections      []SectionReport      //每个槽位一个小票
+	TotalUsed     int                  //总用的token
+	Warnings      []string             // 装配期异常（固定段超预算、history 前缀失效、工具循环撑爆等）
+	Externalized  []ExternalizedReport // 外置量：不计窗口占用，但必须留量
 }
 
 func (r *AssembleReport) addSection(name string, used, budget int, trimmed bool) {
@@ -123,6 +140,13 @@ func (r *AssembleReport) addSection(name string, used, budget int, trimmed bool)
 
 func (r *AssembleReport) warn(format string, a ...any) {
 	r.Warnings = append(r.Warnings, fmt.Sprintf(format, a...))
+}
+
+// addExternalized 记一笔外置。
+// 用切片而不是计数器：排查时要能看到"这次会话外置了哪几条、各自多大、句柄是啥"，
+// 只有一个总数等于没有信息。
+func (r *AssembleReport) addExternalized(tool, handle string, tokens int) {
+	r.Externalized = append(r.Externalized, ExternalizedReport{Tool: tool, Handle: handle, Tokens: tokens})
 }
 
 // String 账本快照，供 REPL 按需打印（TINY_AGENT_DEBUG_CONTEXT=1）。
@@ -140,6 +164,16 @@ func (r AssembleReport) String() string {
 			mark = " ✂"
 		}
 		fmt.Fprintf(&sb, "\n  %-14s %6d / %-6d%s", s.Name, s.Used, s.Budget, mark)
+	}
+	// 外置段单列一行（路线③）。"未计入窗口"这几个字必须写：否则看账本的人
+	// 会以为 TotalUsed 算重了，进而怀疑整个账本的可信度。
+	if len(r.Externalized) > 0 {
+		total := 0
+		for _, e := range r.Externalized {
+			total += e.Tokens
+		}
+		fmt.Fprintf(&sb, "\n  %-14s %6d token（%d 条，已落盘未计入窗口）",
+			"externalized", total, len(r.Externalized))
 	}
 	for _, w := range r.Warnings {
 		fmt.Fprintf(&sb, "\n  ! %s", w)

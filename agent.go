@@ -26,7 +26,15 @@ type MinCore struct {
 	model        string
 	systemPrompt string
 	maxTokens    int64
+	results      *ResultStore // 路线③ 外置仓库；为 nil 时退回 L0 纯截断
 }
+
+// SetResultStore 注入外置仓库（main 在启动时调用）。
+//
+// 为什么用 setter 而不是 NewMinCore 的构造参数：外置是**可选能力**，
+// "有则用、无则退化"。塞进构造函数，每个测试和调用点都得凭空造一个仓库，
+// 而它们绝大多数不关心外置。可选依赖用 setter，是这里刻意的选择。
+func (m *MinCore) SetResultStore(rs *ResultStore) { m.results = rs }
 
 // NewMinCore 初始化核心。
 // - client：官方 Go SDK（base_url 用 option.WithBaseURL 指向腾讯 TokenHub 中转）
@@ -241,13 +249,25 @@ func (m *MinCore) SendMessage(ctx context.Context, req SendRequest) (SendResult,
 				continue
 			}
 			raw := stringify(out)
-			text, cut := truncateToolResult(raw, quota)
+			// 路线③：先试着外置（头尾 + 句柄），仓库不可用时函数内部自动退回 L0 纯截断。
+			// 注意这一步把原来的 truncateToolResult 整个替换掉了——不是并存，
+			// 否则会出现"外置了但上下文里还是旧截断结果"的分裂状态。
+			text, handle, cut := externalizeToolResult(m.results, c.name, raw, quota)
 			if cut {
 				// 截断必须留痕：静默截断等于数据损坏，模型和人都该知道这条不完整。
 				// 与工具循环护栏同一待遇（进报告 + 打 stderr），理由也一样——
 				// 只写在报告里、没开 TINY_AGENT_DEBUG_CONTEXT 就完全静默。
-				msg := fmt.Sprintf("工具 %s 结果约 %d token，超单条配额 %d，已截断（原始内容不可恢复，需完整内容请走外置+召回）",
+				// 这一行还兼作账本输入：外置量必须进报告，否则 09-26 那个
+				// "丢了 20649 token 无人记账"的盲区会原封不动保留下来。
+				res.Context.addExternalized(c.name, handle, estimateTextTokens(raw))
+				// 文案必须跟着能力改：旧文案写着"原始内容不可恢复，需完整内容请走
+				// 外置+召回"——那是代码在向模型承诺一个当时还不存在的能力，模型
+				// 照着要却什么也拿不到，只能幻觉。文案与能力对齐是这一步的隐性要求。
+				msg := fmt.Sprintf("工具 %s 结果约 %d token，超单条配额 %d，已外置并截断",
 					c.name, estimateTextTokens(raw), quota)
+				if handle != "" {
+					msg += fmt.Sprintf("（句柄 %s，模型可用 read_result 取回全文）", handle)
+				}
 				res.Context.Warnings = append(res.Context.Warnings, msg)
 				fmt.Fprintln(os.Stderr, ">>> warning:", msg)
 			}

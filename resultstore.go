@@ -35,6 +35,7 @@ const (
 	externalHeadRatio = 2
 	externalTailRatio = 1
 )
+
 //这是一分工具结果的小票，谁做的？文件在哪
 type resultMeta struct {
 	Handle    string    `json:"handle"`     // 句柄，形如 res-3
@@ -51,10 +52,11 @@ type ResultStore struct {
 	session    string // 会话子目录名（同时是 GC 的"当前会话"标记）
 	pageTokens int    // 单次召回返回的 token 上限，= Budget.ToolResultReserve
 
-	mu       sync.Mutex             // 保护 seq / byHandle（Save 与 Read 并发时才需要）
-	seq      int                    // 单调递增序号：句柄与文件名的来源
-	byHandle map[string]resultMeta  // 句柄 -> 元数据：唯一索引
+	mu       sync.Mutex            // 保护 seq / byHandle（Save 与 Read 并发时才需要）
+	seq      int                   // 单调递增序号：句柄与文件名的来源
+	byHandle map[string]resultMeta // 句柄 -> 元数据：唯一索引
 }
+
 func NewResultStore(dir, session string, pageTokens int) (*ResultStore, error) {
 	if dir == "" {
 		dir = resultDirDefault
@@ -81,9 +83,10 @@ func NewResultStore(dir, session string, pageTokens int) (*ResultStore, error) {
 		return nil, err
 	}
 	return s, nil
-
+}
 
 func (s *ResultStore) sessionDir() string { return filepath.Join(s.dir, s.session) }
+
 // reindex 从 *.meta.json 重建句柄索引，并让 seq 接着上次往下走。
 //
 // 为什么必须抬 seq：句柄是 res-<n>，文件名也带 n。如果重启后从 1 重新编号，
@@ -166,6 +169,7 @@ func (s *ResultStore) writeMeta(m resultMeta) error {
 	}
 	return nil
 }
+
 // Read 按行窗口读回全文。offset 从 1 开始。
 //
 // 两个闸门叠在一起：行数（limit / maxRecallLines）+ token（pageTokens）。
@@ -273,6 +277,7 @@ func (s *ResultStore) Read(handle string, offset, limit int) (string, error) {
 	}
 	return head + sb.String() + "\n[已到文件末尾]", nil
 }
+
 // readResultArgs read_result 的入参。
 // 字段名即模型要填的参数名（schema.go 的 functionSchema 直接读 json tag 和
 // description tag 生成 input_schema），所以 tag 是"给模型看的文档"。
@@ -292,7 +297,6 @@ type readResultArgs struct {
 func (s *ResultStore) ReadResult(args readResultArgs) (string, error) {
 	return s.Read(args.Handle, args.Offset, args.Limit)
 }
-
 
 // knownHandles 列出最近的可用句柄，只服务于"句柄写错"时的错误提示。
 // 截断到 8 个：这是给人/模型看的线索，不是全量清单，太长反而淹没有用信息。
@@ -348,6 +352,7 @@ func (s *ResultStore) Cleanup(maxAge time.Duration) (int, error) {
 	}
 	return removed, nil
 }
+
 // externalizeToolResult 一条工具结果的"无损化"闸门：
 //   - 没超配额：原样返回（绝大多数调用走这条，零 IO）
 //   - 超配额：全文落盘，上下文只留 头部 + 中间省略提示 + 尾部 + 句柄标记
@@ -405,6 +410,7 @@ func externalizeToolResult(store *ResultStore, tool, raw string, quota int) (str
 	// 砍中间、留两头：头是格式/表头，尾是结论/错误码。
 	return truncateByTokens(raw, headTokens) + ellipsis + tailByTokens(raw, tailTokens) + marker, handle, true
 }
+
 // tailByTokens 取末尾 n token——truncateByTokens 的反向操作。
 //
 // 为什么必须有它：现有 truncateByTokens 只会**取头**，而本方案的保留策略

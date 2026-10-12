@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time" // 路线③：生成会话 id + GC 保留期
 
 	"github.com/anthropics/anthropic-sdk-go"
 )
@@ -44,20 +45,68 @@ func main() {
 		// 加工具必须同步改这里：模型只从 system prompt 和 tools schema 知道
 		// 自己有什么能力。只加 tools 不改 prompt，模型不会主动去用它——
 		// 这是一处隐性耦合，加/删工具时最容易漏。
-		"You are Baz. Tools: get_color, get_number, read_file. "+
+		//
+		// 路线③ 新增 read_result，这段要写清三件事：
+		//   1. 触发条件：看到"已外置…句柄 res-3"这种标记时
+		//   2. 调用方式：read_result(handle, offset, limit) 按行翻页
+		//   3. 禁止行为：不要说"内容不可用"，也不要猜被砍掉的部分
+		// 少了第 3 条，模型很可能只回一句"内容被截断了"就停下。
+		"You are Baz. Tools: get_color, get_number, read_file, read_result. "+
 			"Use read_file when the user asks about a file's content. "+
-			"Large results are truncated and marked; tell the user when you see a truncation marker.",
+			"Long tool results are truncated and externalized: you will see a marker like "+
+			"[已外置：... 句柄 res-3 ...]. When you see such a marker, call "+
+			"read_result(handle, offset, limit) to read the full content page by page. "+
+			"Never claim the content is unavailable and never guess what was cut.",
 	)
+
+	budget := DefaultBudget()
+
+	// --- 路线③：工具结果外置仓库 ---
+	//
+	// 会话 id 用"时间戳 + pid"：目录名可读（人工排查一眼知道是哪次），
+	// 也不会和上一轮会话撞名。这里刻意不用随机串，就是为了"可读"。
+	sessionID := fmt.Sprintf("%s-%d", time.Now().Format("20060102-150405"), os.Getpid())
+
+	// 第三个参数必须传 budget.ToolResultReserve：召回一页也是 tool_result，
+	// 受同一条闸门约束。传进去 = 全项目只有一个事实来源（这条纪律在
+	// maxTokens / historyBudgetTokens 上已经交过两次学费）。
+	resultStore, err := NewResultStore(resultDirDefault, sessionID, budget.ToolResultReserve)
+	if err != nil {
+		// 构造期失败选择"直接退出"：它涉及磁盘布局（目录、权限），
+		// 早失败比跑到一半发现写不进去好。
+		// 注意区分：构造期失败要退出，运行期落盘失败只降级（见 externalizeToolResult）。
+		fmt.Fprintln(os.Stderr, "初始化外置结果仓库失败", err)
+		os.Exit(1)
+	}
+
+	// GC 放在"进程启动"而不是"每轮请求"：清理是 IO，不该进对话主路径；
+	// 放启动也天然覆盖"上次崩了没来得及清"的情况。
+	if n, cerr := resultStore.Cleanup(resultRetention); cerr != nil {
+		// 清理失败不影响本次会话可用性——最坏结果是多占点磁盘，
+		// 为它退出进程是不成比例的。
+		fmt.Fprintln(os.Stderr, ">>> 清理外置结果失败:", cerr)
+	} else if n > 0 {
+		fmt.Fprintf(os.Stderr, ">>> 清理过期外置结果目录 %d 个\n", n)
+	}
+	llm.SetResultStore(resultStore)
+
 	// 工具名用 snake_case：Go 函数名读出来是 camelCase（readFile），
 	// 但工具名是给模型看的，snake_case 是生态惯例（Anthropic 官方示例也这么写）。
-	readFileTool := newTool(readFile, "读取工作目录内的文本文件，返回全文；超大结果会被截断")
+	//
+	// ★ 顺序是硬要求：read_result 是仓库的**方法值**，tools 必须在仓库之后建，
+	//   否则注册进去的是 nil 接收者，模型一调就 panic。
+	readFileTool := newTool(readFile, "读取工作目录内的文本文件，返回全文；超大结果会被截断并外置")
 	readFileTool.Name = "read_file"
+	// 方法值推出来的名字是 "ReadResult"（首字母大写），必须显式覆盖成 snake_case，
+	// 和 read_file 一样——忘了覆盖，模型看到的就是个不合惯例的工具名。
+	readResultTool := newTool(resultStore.ReadResult, "按句柄读回被外置的完整工具结果，按行窗口读取（offset 从 1 开始）")
+	readResultTool.Name = "read_result"
 	tools := []*Tool{
 		newTool(getColor, "随机返回一个颜色"),
 		newTool(getNumber, "随机返回 0-100 的整数"),
 		readFileTool,
+		readResultTool,
 	}
-	budget := DefaultBudget()
 	store, err := NewStore("memory.db")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "打开记忆库失败", err)
