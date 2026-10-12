@@ -292,3 +292,185 @@ type readResultArgs struct {
 func (s *ResultStore) ReadResult(args readResultArgs) (string, error) {
 	return s.Read(args.Handle, args.Offset, args.Limit)
 }
+
+
+// knownHandles 列出最近的可用句柄，只服务于"句柄写错"时的错误提示。
+// 截断到 8 个：这是给人/模型看的线索，不是全量清单，太长反而淹没有用信息。
+func (s *ResultStore) knownHandles() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.byHandle) == 0 {
+		return "（无）"
+	}
+	hs := make([]string, 0, len(s.byHandle))
+	for h := range s.byHandle {
+		hs = append(hs, h)
+	}
+	sort.Strings(hs) // map 遍历顺序随机，排序后提示稳定，模型更容易比对
+	if len(hs) > 8 {
+		hs = hs[len(hs)-8:]
+	}
+	return strings.Join(hs, ", ")
+}
+
+// Cleanup 删除超过保留期的"会话目录"，返回删除的目录数。
+//
+// 为什么不做引用计数：引用方是**模型上下文**，进程根本观测不到；而且计数
+// 在重启后无法恢复。做出来只会是一套自欺的账。"保留期 + 删整目录"是能
+// 自洽的最简策略。
+//
+// ★ 隐性耦合（将来改代码前必须先看这段）：判活用的是**目录 ModTime**，
+// 它成立的前提是 Save 每次都**新建文件**——新文件会刷新父目录 mtime。
+// 如果哪天为了少几个文件改成"追加写同一个文件"，目录 mtime 不再刷新，
+// 活跃会话就会被误删。这是外置方案最容易在半年后被自己坑到的地方。
+func (s *ResultStore) Cleanup(maxAge time.Duration) (int, error) {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil // 还没有任何会话目录，无事可做
+		}
+		return 0, err
+	}
+	deadline := time.Now().Add(-maxAge)
+	removed := 0
+	for _, e := range entries {
+		// 只处理目录，且永不删当前会话——这一条是"不能错"的底线
+		if !e.IsDir() || e.Name() == s.session {
+			continue
+		}
+		info, ierr := e.Info()
+		if ierr != nil || info.ModTime().After(deadline) {
+			continue
+		}
+		if rerr := os.RemoveAll(filepath.Join(s.dir, e.Name())); rerr == nil {
+			removed++
+		}
+	}
+	return removed, nil
+}
+// externalizeToolResult 一条工具结果的"无损化"闸门：
+//   - 没超配额：原样返回（绝大多数调用走这条，零 IO）
+//   - 超配额：全文落盘，上下文只留 头部 + 中间省略提示 + 尾部 + 句柄标记
+//   - 落盘失败：退回 L0 纯截断，并在标记里写明失败（绝不假装无损）
+//
+// 返回值三元组：(进上下文的内容, 句柄, 是否发生过截断/外置)
+// 为什么返回句柄而不是让调用方从标记里正则抠：文案一改，抠法就废。
+func externalizeToolResult(store *ResultStore, tool, raw string, quota int) (string, string, bool) {
+	used := estimateTextTokens(raw)
+
+	// ① 先比配额再落盘：省 IO。工具结果 99% 是小的，
+	//    不能因为"可能超"就给每个结果都写一次盘。
+	if used <= quota {
+		return raw, "", false
+	}
+
+	// ② 没有仓库 = 外置能力不可用（比如某个测试没注入）。
+	//    这条分支让整个功能可以分步落地：先把闸门接上（行为与 L0 完全一致），
+	//    再建仓库；任何一步出问题都不会让 agent 崩。也让 agent.go 不用写
+	//    if m.results != nil。
+	if store == nil {
+		text, _ := truncateToolResult(raw, quota)
+		return text, "", true
+	}
+
+	// ③ 落盘失败（磁盘满、权限不足）不假装成功：退回 L0 纯截断，
+	//    并且**在标记里写明失败**。理由和"截断必须留痕"一样——
+	//    静默的信息损失就是数据损坏。这也是一处诚实边界：
+	//    外置不是"一定无损"，它依赖磁盘可写。
+	handle, err := store.Save(tool, raw)
+	if err != nil {
+		text, _ := truncateToolResult(raw, quota)
+		return text + "\n…[外置失败，完整内容已丢失: " + err.Error() + "]", "", true
+	}
+
+	// 标记要做三件事：说清"这是什么"、给出"怎么读回来"、给出"读回来的确切调用"。
+	// 少了最后一项，模型经常回一句"内容被截断了"就停了。
+	marker := fmt.Sprintf("\n…[已外置：原始约 %d token / %d 行，句柄 %s；用 read_result(handle=%q, offset=1, limit=200) 按行读回全文]",
+		used, countLines(raw), handle, handle)
+	ellipsis := "\n…（中间省略）…\n"
+
+	// 正文额度 = 配额 − 标记 − 省略提示 − 8。
+	// 那 8 是给三段省略号（truncateByTokens / tailByTokens 各自追加的 "…"）
+	// 和"字节/3"在边界上的估算回弹留的余量——与 truncateToolResult 里 −2
+	// 同一个理由，这里追加物更多，所以余量更大。
+	// 这是"闸门与账本必须同源"的代价：宁可少留 8 token，
+	// 也不能出现"外置之后仍然超配额"这种自相矛盾。
+	body := quota - estimateTextTokens(marker) - estimateTextTokens(ellipsis) - 8
+	if body < 0 {
+		body = 0 // 配额小到连包装都放不下：正文归零，但标记必须留
+	}
+	headTokens := body * externalHeadRatio / (externalHeadRatio + externalTailRatio)
+	tailTokens := body - headTokens // 用减法而不是再乘一次：保证头尾之和正好等于 body
+
+	// 砍中间、留两头：头是格式/表头，尾是结论/错误码。
+	return truncateByTokens(raw, headTokens) + ellipsis + tailByTokens(raw, tailTokens) + marker, handle, true
+}
+// tailByTokens 取末尾 n token——truncateByTokens 的反向操作。
+//
+// 为什么必须有它：现有 truncateByTokens 只会**取头**，而本方案的保留策略
+// 是"头 + 尾"。
+// 为什么必须做 UTF-8 回退：估算口径是 字节数/3，切点几乎必然落在多字节
+// 汉字的中间；切出半个字符会让 JSON 编码和模型输入都出问题（项目在
+// truncateByTokens 里已经踩过这个坑）。RuneStart 就是"这个字节是不是一个
+// 字符的开头"，不是就往后挪一个字节。
+func tailByTokens(s string, tokens int) string {
+	if tokens <= 0 {
+		return ""
+	}
+	maxBytes := tokens * 3
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := len(s) - maxBytes
+	for cut < len(s) && !utf8.RuneStart(s[cut]) {
+		cut++
+	}
+	return "…" + s[cut:]
+}
+
+// countLines 数行数：以 \n 为准，最后一行没有换行符也算一行。
+// 不用 strings.Split（会为几十万行分配一个巨大切片），Count 只扫一遍。
+func countLines(s string) int {
+	if s == "" {
+		return 0
+	}
+	n := strings.Count(s, "\n")
+	if !strings.HasSuffix(s, "\n") {
+		n++
+	}
+	return n
+}
+
+// parseSeq 从 "res-12" 抠出 12（reindex 抬 seq 用）。
+// 解析失败返回 0：坏的 meta 不该把整个索引搞崩，跳过它更安全。
+func parseSeq(handle string) int {
+	i := strings.LastIndex(handle, "-")
+	if i < 0 {
+		return 0
+	}
+	n, err := strconv.Atoi(handle[i+1:])
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// safeName 把工具名净化成文件名安全片段。
+// 工具名来自我们的代码，理论上是安全的；这里只是防御——文件名是要拼进
+// 路径的，一旦将来有工具名来自配置/插件，未净化的名字就是路径穿越。
+func safeName(s string) string {
+	s = strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			return r
+		}
+		return '_'
+	}, s)
+	if s == "" {
+		return "tool"
+	}
+	if len(s) > 32 {
+		s = s[:32] // 截断只为文件系统上限，不改变语义
+	}
+	return s
+}
