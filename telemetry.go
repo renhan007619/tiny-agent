@@ -4,14 +4,17 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // 这个文件只放两样东西：基建（provider / exporter / 传播器）和语义约定
@@ -135,11 +138,41 @@ func InitTelemetry(ctx context.Context) (func(context.Context) error, error) {
 	return tp.Shutdown, nil
 }
 
-//1. **程序启动**：调用 `InitTelemetry` → 组装 SDK、采样、处理器、导出器、传播器 → 注入全局 API
-//2. **请求进来**：业务代码调用 `otel.Tracer("service").Start(ctx, "span名")`
-//3. **SDK 内部**：采样器决策是否采样 → 采样则创建 span，自动附加 Resource 元数据
-//4. **业务执行**：逻辑结束后调用 `span.End()`
-//5. **打包处理**：span 交给处理器 → 批量模式攒批 / 同步模式立刻导出
-//6. **导出发送**：导出器把 span 编码成 OTLP 格式 → 发给后端 / Collector
-//7. **跨服务调用**：传播器把 trace 上下文注入请求头 → 下游解析恢复链路
-//8. **程序退出**：调用 `shutdown` → 刷新剩余 span，优雅关闭
+// 1. **程序启动**：调用 `InitTelemetry` → 组装 SDK、采样、处理器、导出器、传播器 → 注入全局 API
+// 2. **请求进来**：业务代码调用 `otel.Tracer("service").Start(ctx, "span名")`
+// 3. **SDK 内部**：采样器决策是否采样 → 采样则创建 span，自动附加 Resource 元数据
+// 4. **业务执行**：逻辑结束后调用 `span.End()`
+// 5. **打包处理**：span 交给处理器 → 批量模式攒批 / 同步模式立刻导出
+// 6. **导出发送**：导出器把 span 编码成 OTLP 格式 → 发给后端 / Collector
+// 7. **跨服务调用**：传播器把 trace 上下文注入请求头 → 下游解析恢复链路
+// 8. **程序退出**：调用 `shutdown` → 刷新剩余 span，优雅关闭
+// sampleRatio 读采样率，非法值一律退回 1.0（宁可多采，不要静默丢样本）。
+func sampleRatio() float64 {
+	v := os.Getenv("TINY_AGENT_TRACE_SAMPLE")
+	if v == "" {
+		return 1.0
+	}
+	r, err := strconv.ParseFloat(v, 64)
+	if err != nil || r < 0 || r > 1 {
+		fmt.Fprintf(os.Stderr, ">>> 忽略非法的 TINY_AGENT_TRACE_SAMPLE=%q（按 1.0 处理）\n", v)
+		return 1.0
+	}
+	return r
+}
+
+// tracer 取全局 tracer。otel.Tracer 走 delegate 机制，即使在
+// SetTracerProvider 之前调用也不报错，所以不需要"注入"。
+func tracer() trace.Tracer { return otel.Tracer(tracerName) }
+
+// recordErr 把错误记进 span。两件事都要做：
+//   - RecordError 记一条 error event（保留堆栈和原始信息）
+//   - SetStatus(Error) 改 span 状态（后端靠状态做错误率统计和采样决策）
+//
+// 只做前者，后端看不出这条 trace 是失败的；只做后者，丢了错误详情。
+func recordErr(span trace.Span, err error) {
+	if err == nil {
+		return
+	}
+	span.RecordError(err)
+	span.SetStatus(codes.Error, err.Error())
+}
