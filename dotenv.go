@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 	"strings"
 )
@@ -28,5 +29,11 @@ func loadDotEnv() {
 			continue // 没有 = 的脏行
 		}
 		os.Setenv(strings.TrimSpace(k), strings.TrimSpace(v))
+	}
+	// Scan 循环结束后必须查 Err：Scan 返回 false 除了正常 EOF，还可能是
+	// 读文件出错。不查的话 .env 读到一半坏了会静默丢掉后面的配置行，
+	// 排查时毫无线索（"key 明明写了为什么没生效"）。
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintln(os.Stderr, "读取 .env 失败:", err)
 	}
 }

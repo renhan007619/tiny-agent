@@ -6,9 +6,12 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time" // 路线③：生成会话 id + GC 保留期
 
 	"github.com/anthropics/anthropic-sdk-go"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // 滑动窗口预算（按公式推导，假设窗口 128k）：输出预留 2048×6≈12k，
@@ -118,7 +121,40 @@ func main() {
 	// history 是短期记忆的"外部持有者"：每轮对话结束后把更新后的
 	// messages 存回 history，下一轮再传进去，任务状态才得以延续。
 	// 注意：它只活在进程内存里——退出程序就全部丢失。
+	// --- 启动横幅（简单 UI）---
+	// 让用户知道 agent 就绪、用的什么模型/工具/哪次会话。工具名从 tools
+	// 切片动态生成，不硬编码——systemPrompt 那处工具名耦合改不了，这里
+	// 至少别再添一处。横幅走 stdout：它是 REPL 主体的一部分（进度/账本才走 stderr）。
+	toolNames := make([]string, len(tools))
+	for i, t := range tools {
+		toolNames[i] = t.Name
+	}
+	fmt.Printf("tiny-agent 已就绪 | model=%s | session=%s\n工具: %s\n（Ctrl+Z 回车退出；设 TINY_AGENT_DEBUG_CONTEXT=1 可看装配账本）\n",
+		model, sessionID, strings.Join(toolNames, ", "))
+
 	ctx := context.Background()
+
+	// --- 可观测性初始化 ---
+	// 失败只降级、不阻断：agent 能不能跑比能不能观测重要。这里刻意不 os.Exit，
+	// 也和"构造期失败要退出"（ResultStore）不同——那个是磁盘布局错误，这个只是
+	// 没有 trace，业务功能完整。
+	shutdown, terr := InitTelemetry(ctx)
+	if terr != nil {
+		fmt.Fprintln(os.Stderr, ">>> 可观测性初始化失败（本次运行无 trace）:", terr)
+	} else {
+		// 必须显式 Shutdown：Batch 默认 5s 落一次网，直接 return 会丢掉最后一批
+		// span——包括"用户最后一句问话"那一整条 trace，而它往往正是你最想排查
+		// 的那条。用独立超时 ctx：Shutdown 内部要发最后一个 batch 的 HTTP 请求，
+		// 复用无超时的 ctx 会让后端挂掉时退出路径永远卡住。
+		defer func() {
+			sctx, scancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer scancel()
+			if err := shutdown(sctx); err != nil {
+				fmt.Fprintln(os.Stderr, ">>> 关闭 tracer 失败（最后一批 span 可能丢失）:", err)
+			}
+		}()
+	}
+
 	var history []anthropic.MessageParam
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
@@ -133,8 +169,20 @@ func main() {
 		if hits, serr := store.Search(text, 3); serr == nil {
 			memoryHits = hits
 		}
-		// 预算、裁剪、system 拼装全部在 SendMessage 内部完成
-		res, err := llm.SendMessage(ctx, SendRequest{
+		// 每轮 60s 超时：LLM 请求挂起时（死代理/网关不吐响应），"无限卡住
+		// 还零输出"是最差失败模式。超时把它变成显式报错，与其他 error 走
+		// 同一条排查路径。
+		askCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		// 每轮一个 root span：一次"任务"就是用户这一次输入。
+		// 不按整个会话切 trace——会话可能几十分钟几十轮，trace 太长没法看；
+		// 会话级关联走 session.id 属性。
+		// 注意 askCtx 被重新赋值：这个 ctx 往下传，agent.go 里所有 span 才会
+		// 成为它的子节点。ctx 不往下传 = 断链，这是 OTel 第一高频坑。
+		askCtx, turnSpan := tracer().Start(askCtx, spanTurn, trace.WithAttributes(
+			attribute.String(attrSessionID, sessionID),
+			attribute.Int(attrHistoryMsgs, len(history)),
+		))
+		res, err := llm.SendMessage(askCtx, SendRequest{
 			UserMessage: text,
 			History:     history,
 			Tools:       tools,
@@ -145,6 +193,11 @@ func main() {
 			// 实测通过（不 400 且 usage 出现缓存计费字段）再开。
 			EnableCache: false,
 		})
+		cancel() // SendMessage 已返回（无论成败），计时器立刻释放
+		// span 必须在循环内显式 End：写成 defer 会累积到 main 返回，那样第 1 轮
+		// 的 span 会把后面所有轮次的时间都算进去，耗时全错。
+		recordErr(turnSpan, err)
+		turnSpan.End()
 		if err != nil {
 			fmt.Fprintln(os.Stderr, ">>> error:", err)
 			// 失败时的账本更有排查价值：到底装了多大、谁被砍了

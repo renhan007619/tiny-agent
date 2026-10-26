@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -64,6 +66,15 @@ const (
 	attrToolHandle     = "tool.result.handle"
 )
 
+// 整条链路（对着 InitTelemetry 从上往下读，正好一步步对上）：
+//  1. 程序启动 → InitTelemetry：组装 Resource、采样器、处理器、导出器、传播器，注入全局 API
+//  2. 业务代码 → otel.Tracer(...).Start(ctx, "span 名")，拿到的 ctx 必须继续往下传
+//  3. SDK：采样器先决策采不采 → 采则建 span，自动附加 Resource 元数据
+//  4. 业务结束 → span.End()
+//  5. 处理器：Batch 攒批（生产）/ Syncer 立刻导出（本地调试）
+//  6. 导出器：把 span 编码成 OTLP，发给后端或 Collector
+//  7. 跨服务：传播器把 traceparent 注入请求头，下游解析后接回同一条 trace
+//  8. 程序退出 → Shutdown：刷新剩余 span，优雅关闭
 func InitTelemetry(ctx context.Context) (func(context.Context) error, error) {
 	// 端点交给标准环境变量 OTEL_EXPORTER_OTLP_ENDPOINT（默认 localhost:4318），
 	// 代码里不硬编码后端地址——换后端是配置问题，不是代码问题。
@@ -138,14 +149,6 @@ func InitTelemetry(ctx context.Context) (func(context.Context) error, error) {
 	return tp.Shutdown, nil
 }
 
-// 1. **程序启动**：调用 `InitTelemetry` → 组装 SDK、采样、处理器、导出器、传播器 → 注入全局 API
-// 2. **请求进来**：业务代码调用 `otel.Tracer("service").Start(ctx, "span名")`
-// 3. **SDK 内部**：采样器决策是否采样 → 采样则创建 span，自动附加 Resource 元数据
-// 4. **业务执行**：逻辑结束后调用 `span.End()`
-// 5. **打包处理**：span 交给处理器 → 批量模式攒批 / 同步模式立刻导出
-// 6. **导出发送**：导出器把 span 编码成 OTLP 格式 → 发给后端 / Collector
-// 7. **跨服务调用**：传播器把 trace 上下文注入请求头 → 下游解析恢复链路
-// 8. **程序退出**：调用 `shutdown` → 刷新剩余 span，优雅关闭
 // sampleRatio 读采样率，非法值一律退回 1.0（宁可多采，不要静默丢样本）。
 func sampleRatio() float64 {
 	v := os.Getenv("TINY_AGENT_TRACE_SAMPLE")
@@ -176,3 +179,117 @@ func recordErr(span trace.Span, err error) {
 	span.RecordError(err)
 	span.SetStatus(codes.Error, err.Error())
 }
+
+// annotateContext 把上下文账本摊成 span 属性。
+// 别人的 trace 只能告诉你"这一轮花了多少 token"，这条能告诉你
+// "钱花在哪一段、哪一段被裁了、有多少内容被移出了窗口"。
+func annotateContext(span trace.Span, r AssembleReport) {
+	ratio := 0.0
+	if r.Available > 0 {
+		ratio = float64(r.TotalUsed) / float64(r.Available)
+	}
+	span.SetAttributes(
+		attribute.Int("context.window", r.Window),
+		attribute.Int("context.output_reserve", r.OutputReserve),
+		attribute.Int("context.available", r.Available),
+		attribute.Int("context.message_budget", r.MessageBudget),
+		attribute.Int("context.used", r.TotalUsed),
+		// 水位线：单独一个浮点比，比在脑子里算除法快得多，
+		// 也是将来做告警（水位连续 N 次 > 90%）的唯一输入。
+		attribute.Float64("context.used_ratio", ratio),
+	)
+	for _, s := range r.Sections {
+		k := "context.section." + sectionKey(s.Name)
+		span.SetAttributes(
+			attribute.Int(k+".used", s.Used),
+			attribute.Int(k+".budget", s.Budget),
+			attribute.Bool(k+".trimmed", s.Trimmed),
+		)
+	}
+	// 外置量必须进 trace：它是"丢了 20649 token 无人记账"那个盲区的出口。
+	// 用量是定值走属性，明细条数不定走 event（属性 key 必须固定）。
+	if len(r.Externalized) > 0 {
+		total := 0
+		for _, e := range r.Externalized {
+			total += e.Tokens
+			span.AddEvent("context.externalized", trace.WithAttributes(
+				attribute.String("tool.name", e.Tool),
+				attribute.String(attrToolHandle, e.Handle),
+				attribute.Int("tool.result.tokens", e.Tokens),
+			))
+		}
+		span.SetAttributes(
+			attribute.Int("context.externalized.tokens", total),
+			attribute.Int("context.externalized.count", len(r.Externalized)),
+		)
+	}
+	// 告警走 event 而不是属性：属性 key 必须固定，告警是"追加式"事实、
+	// 条数不定；event 天生干这个（带时间点，不参与索引基数）。
+	for _, w := range r.Warnings {
+		span.AddEvent("context.warning", trace.WithAttributes(attribute.String("message", w)))
+	}
+}
+
+// sectionKey 把账本里的中文段名映射成规范属性 key。
+// 段名是给人看的（"system(记忆)"），属性 key 是给后端索引的，两者不该共用
+// 一套字符串——中文和括号在部分后端会被丢弃或转义，属性"设了但查不到"。
+func sectionKey(name string) string {
+	switch name {
+	case "tools":
+		return "tools"
+	case "system(稳定)":
+		return "system_stable"
+	case "system(记忆)":
+		return "system_memory"
+	case "history":
+		return "history"
+	case "user(本轮)":
+		return "user"
+	}
+	// 兜底：非 ASCII 字母数字一律换下划线，保证属性 key 合法。
+	var sb strings.Builder
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			sb.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			sb.WriteRune(r + ('a' - 'A'))
+		default:
+			sb.WriteByte('_')
+		}
+	}
+	return sb.String()
+}
+
+// consoleExporter 把 span 直接打到 stderr，用于没有 Jaeger/Tempo 时验收。
+// 不引官方 stdout exporter 的理由：① 不想为调试多引一个包；② 官方导出的
+// 是 SDK 内部结构大 JSON，人读着痛苦；③ 输出格式要对齐上面那张属性表，
+// 方便直接和账本对账。
+// 关键是它和 Jaeger 实现的是同一个 SpanExporter 接口——换 exporter 不用改
+// 任何一处埋点代码。这就是"管道与语义分离"最实在的证据。
+type consoleExporter struct{}
+
+func (consoleExporter) ExportSpans(_ context.Context, spans []sdktrace.ReadOnlySpan) error {
+	for _, s := range spans {
+		fmt.Fprintf(os.Stderr, "=== [span] %-18s %10s  trace=%s\n",
+			s.Name(),
+			s.EndTime().Sub(s.StartTime()).Round(time.Microsecond),
+			s.SpanContext().TraceID().String()[:8])
+		if st := s.Status(); st.Code != codes.Unset {
+			fmt.Fprintf(os.Stderr, "      ! status = %v: %s\n", st.Code, st.Description)
+		}
+		for _, a := range s.Attributes() {
+			fmt.Fprintf(os.Stderr, "      %s = %v\n", a.Key, a.Value.Emit())
+		}
+		for _, e := range s.Events() {
+			fmt.Fprintf(os.Stderr, "      event %s", e.Name)
+			for _, a := range e.Attributes {
+				fmt.Fprintf(os.Stderr, " %s=%v", a.Key, a.Value.Emit())
+			}
+			fmt.Fprintln(os.Stderr)
+		}
+	}
+	return nil
+}
+
+func (consoleExporter) Shutdown(context.Context) error { return nil }

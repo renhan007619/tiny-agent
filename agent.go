@@ -7,10 +7,13 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
 	"github.com/anthropics/anthropic-sdk-go/packages/param"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // ============ 3. MinCore：Agent 核心（tool_use / tool_result 循环） ============
@@ -155,6 +158,12 @@ func (m *MinCore) SendMessage(ctx context.Context, req SendRequest) (SendResult,
 	// --- 短期记忆写入（1/3）：追加用户消息 ---
 	// messages 就是短期记忆：记录"这次任务从头到尾发生了什么"
 
+	// 装配单独一个 span：账本本来就有结构化数据，这里只给它接一条机器可读的
+	// 出口，context_assembler.go 一行不用改。刻意丢掉返回的 ctx——装配是纯函数，
+	// 没有子 span 需要继承它；把 asmSpan 的 ctx 传给 callModel 会让 gen_ai.chat
+	// 变成 context.assemble 的子节点，span 树从平铺变串行嵌套，是错的。
+	_, asmSpan := tracer().Start(ctx, spanAssemble,
+		trace.WithAttributes(attribute.Bool(attrCacheEnabled, req.EnableCache)))
 	asm := AssembleContext(AssembleInput{
 		BaseSystem:  m.systemPrompt,
 		MemoryHits:  req.MemoryHits,
@@ -164,6 +173,8 @@ func (m *MinCore) SendMessage(ctx context.Context, req SendRequest) (SendResult,
 		Budget:      req.Budget,
 		EnableCache: req.EnableCache,
 	})
+	annotateContext(asmSpan, asm.Report)
+	asmSpan.End()
 	res := SendResult{Context: asm.Report}
 	messages := asm.Messages
 
@@ -195,11 +206,31 @@ func (m *MinCore) SendMessage(ctx context.Context, req SendRequest) (SendResult,
 
 		// --- 工具循环：最多 maxRounds 轮 ---
 		// 1) 调模型
-		resp, err := m.callModel(ctx, messages, schemas, asm.System)
+		// 过程 UI：走 stderr（与 warning/账本同一通道），stdout 只留对话主体。
+		// 没有它，工具循环期间终端完全静默，用户分不清是卡在等模型还是在调工具。
+		fmt.Fprintf(os.Stderr, ">>> [%d] 调用模型...\n", round+1)
+		t0 := time.Now()
+		// 一次模型调用一个 span，且开在工具循环内部：一次用户输入可能调好几次
+		// 模型，合成一个就丢了"第几轮开始变慢"的定位能力。带 round 才能说清
+		// "第 2 轮 15s 是历史变长导致的"。
+		callCtx, chatSpan := tracer().Start(ctx, spanChat, trace.WithAttributes(
+			attribute.String(attrModel, m.model),
+			attribute.Int(attrRound, round+1),
+		))
+		resp, err := m.callModel(callCtx, messages, schemas, asm.System)
 		if err != nil {
+			recordErr(chatSpan, err)
+			chatSpan.End()
 			res.History = messages
 			return res, err
 		}
+		chatSpan.SetAttributes(
+			attribute.Int64(attrInputTokens, resp.Usage.InputTokens),
+			attribute.Int64(attrOutputTokens, resp.Usage.OutputTokens),
+			attribute.Int64(attrCacheRead, resp.Usage.CacheReadInputTokens),
+			attribute.Int64(attrCacheWrite, resp.Usage.CacheCreationInputTokens),
+		)
+		fmt.Fprintf(os.Stderr, ">>> [%d] 模型返回 (%.1fs)\n", round+1, time.Since(t0).Seconds())
 
 		// 2) 收集本轮模型要求的工具调用
 		type call struct {
@@ -212,6 +243,11 @@ func (m *MinCore) SendMessage(ctx context.Context, req SendRequest) (SendResult,
 				calls = append(calls, call{id: v.ID, name: v.Name, input: v.Input})
 			}
 		}
+		// 模型调用的收尾放在这里而不是紧跟 token 属性：本轮要求了几个工具要解析
+		// 完 content 才知道，而 span.End() 之后 SetAttributes 会被 SDK 直接忽略。
+		// 解析只是遍历数组做类型断言，微秒级，不会污染耗时归因。
+		chatSpan.SetAttributes(attribute.Int(attrToolCalls, len(calls)))
+		chatSpan.End()
 
 		// 3) 模型没要求调工具 -> 准备直接回答，退出循环
 		if len(calls) == 0 {
@@ -225,6 +261,14 @@ func (m *MinCore) SendMessage(ctx context.Context, req SendRequest) (SendResult,
 			res.Reply = sb.String()
 			return res, nil
 		}
+
+		// 过程 UI：报出这轮模型要求调哪些工具。慢的时候据此可分清
+		// "在等模型"（上一行停着）还是"在执行工具"（本行之后停着）。
+		names := make([]string, len(calls))
+		for i, c := range calls {
+			names[i] = c.name
+		}
+		fmt.Fprintf(os.Stderr, ">>> [%d] 调用工具: %s\n", round+1, strings.Join(names, ", "))
 
 		// 4) 短期记忆写入（2/3）：助手这轮完整内容原样放回历史
 		messages = append(messages, anthropic.NewAssistantMessage(assistantContent(resp.Content)...))
@@ -243,17 +287,34 @@ func (m *MinCore) SendMessage(ctx context.Context, req SendRequest) (SendResult,
 			}
 			// 真正执行工具。注意这两步不能省：没有 execute，模型永远收不到工具结果；
 			// 执行失败也必须回一条 is_error 的 tool_result，否则这次调用会悬空。
+			// span 开在调用点就够：execute 是反射调用任意 0/1 参函数，工具本身
+			// 拿不到 ctx，加参数只会多一个用不上的形参。开在这里它已经是
+			// turn span 的子节点。
+			_, toolSpan := tracer().Start(ctx, spanTool, trace.WithAttributes(
+				attribute.String(attrToolName, c.name),
+				attribute.Int(attrToolInputBytes, len(c.input)),
+			))
 			out, execErr := tool.execute(c.input)
 			if execErr != nil {
+				recordErr(toolSpan, execErr)
+				toolSpan.End()
 				results = append(results, anthropic.NewToolResultBlock(c.id, "tool error: "+execErr.Error(), true))
 				continue
 			}
 			raw := stringify(out)
+			toolSpan.SetAttributes(attribute.Int(attrToolResBytes, len(raw)))
 			// 路线③：先试着外置（头尾 + 句柄），仓库不可用时函数内部自动退回 L0 纯截断。
 			// 注意这一步把原来的 truncateToolResult 整个替换掉了——不是并存，
 			// 否则会出现"外置了但上下文里还是旧截断结果"的分裂状态。
 			text, handle, cut := externalizeToolResult(m.results, c.name, raw, quota)
 			if cut {
+				// 外置只记句柄和量，内容不进 trace——后端存不下 20k token 的工具
+				// 结果，而句柄能直接反查 resultstore 里的落盘文件。
+				toolSpan.SetAttributes(
+					attribute.Bool(attrToolTruncated, true),
+					attribute.String(attrToolHandle, handle),
+					attribute.Int(attrToolResTokens, estimateTextTokens(raw)),
+				)
 				// 截断必须留痕：静默截断等于数据损坏，模型和人都该知道这条不完整。
 				// 与工具循环护栏同一待遇（进报告 + 打 stderr），理由也一样——
 				// 只写在报告里、没开 TINY_AGENT_DEBUG_CONTEXT 就完全静默。
@@ -271,6 +332,7 @@ func (m *MinCore) SendMessage(ctx context.Context, req SendRequest) (SendResult,
 				res.Context.Warnings = append(res.Context.Warnings, msg)
 				fmt.Fprintln(os.Stderr, ">>> warning:", msg)
 			}
+			toolSpan.End()
 			// 每个工具调用都要有对应的 tool_result，用 tool_use_id 关联
 			results = append(results, anthropic.NewToolResultBlock(c.id, text, false))
 		}
