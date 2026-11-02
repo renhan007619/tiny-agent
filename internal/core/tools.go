@@ -1,5 +1,4 @@
-package main
-
+package core
 import "math/rand"
 
 // ============ 1. 工具函数：Agent 的能力集 ============

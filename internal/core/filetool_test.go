@@ -1,5 +1,4 @@
-package main
-
+package core
 import (
 	"os"
 	"path/filepath"

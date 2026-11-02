@@ -1,6 +1,5 @@
 // tiny-agent：最小可用 Agent 的 Go 实现（工具调用 + 短期记忆 + 上下文装配预算）。
-package main
-
+package core
 import (
 	"bufio"
 	"context"
@@ -24,7 +23,7 @@ import (
 //  2. schema.go    工具转换层（函数 -> API 工具说明书）
 //  3. agent.go     MinCore 核心循环
 //  4. main.go      REPL 入口（history 即短期记忆，进程内有效）
-func main() {
+func Main() {
 	loadDotEnv() // 读 .env 里的配置
 	apiKey := os.Getenv("BAZ_OPENAI_API_KEY")
 	baseURL := os.Getenv("BAZ_OPENAI_BASE_URL")
