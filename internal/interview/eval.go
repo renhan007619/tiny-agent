@@ -1,9 +1,8 @@
-// Package interview 是校招模拟面试官的业务包。
+// Package interview 是模拟面试官的业务代码。
 //
-// D1 只落地 EVAL 协议：模型每轮回话时除了给出人话，
-// 还要吐一段结构化判断（分数 / 是否推进 / 盲点 / 四维分）。
-// 这份协议是后续状态机（D2）、诊断报告（D3）、SM-2 排期（D7）、
-// 失败归因（D10）的共同上游，所以它是全项目第一个被定下来的契约。
+// 这里只有一条规矩：聊天归聊天，打分归打分。
+// 聊天那条路上，模型只说人话，一个字的结构都不吐——用户等着看下一题，等不起。
+// 打分在后台单独跑，这一题答完了就开始算，算多久都没人等。
 package interview
 
 import (
@@ -14,157 +13,162 @@ import (
 	"strings"
 )
 
-// ---------- 协议定界符 ----------
+// 打分拆成两块，各管各的：
+//
+//	Score  只管"踩了哪几条坑"——用来算档位、算平均分、跨场次对比
+//	Review 只管"这次具体差在哪"——用人话写，给人看
+//
+// 为什么分数不写进 Score：
+// 因为分数现在不由模型给，由代码用 CombineTier 算出来（见 rubric.go）。
+// 模型报 hits，代码算档位——模型没有"我觉得扣两分比较合适"这个权限。
 
-const (
-	// EvalOpen / EvalClose 是模型输出里"表格块"的定界符。
-	// [面试-细节] 不用 HTML 注释 <!-- -->：模型回答里若出现 "-->",
-	// 注释会被提前截断，JSON 直接腰斩。
-	EvalOpen  = "<<<EVAL"
-	EvalClose = "EVAL>>>"
-)
-
-// ---------- 协议数据结构 ----------
-
-// DimensionScores 四个维度，用来回答"差在哪"而不只是"差多少"。
-type DimensionScores struct {
-	TechnicalDepth      int `json:"technical_depth"`      // 技术深度
-	ProjectArticulation int `json:"project_articulation"` // 项目表达
-	Communication       int `json:"communication"`        // 沟通表达
-	ProblemSolving      int `json:"problem_solving"`      // 问题求解
+// Score 是一次判卷的结论。
+//
+// 三个字段里只有一个来自模型：
+//
+//	Hits     模型报的「踩了哪几条坑」  ← 模型给的
+//	Tier     代码用 CombineTier 算的档位   ← 算出来的
+//	Total    代码用档位查出来的分         ← 算出来的
+//
+// 以前这里是 total/depth/project/talk/solve 五个数字，全由模型自由填写。
+// 那套东西的问题是：它给了模型一个 0~10 的自由赋值空间，它就在中间挑。
+// 8 道题全挤在 4~6 分，不是因为它懒，是因为"给几分"这个问题本身太开放。
+type Score struct {
+	Tier     Tier              `json:"-"`        // A-E，代码算的
+	Hits     []string          `json:"hits"`     // 命中的扣分项 id
+	Evidence map[string]string `json:"evidence"` // 每项一句原文依据，可以空
+	Total    int               `json:"-"`        // = Tier.Score()
+	Partial  bool              `json:"-"`        // 这些数字是补出来的，不是模型原话
 }
 
-// Evaluation 是模型每轮必须填的那张表。
-type Evaluation struct {
-	Score           int             `json:"score"`            // 0-10
-	ShouldAdvance   bool            `json:"should_advance"`   // 是否进入下一阶段
-	WeakPoints      []string        `json:"weak_points"`      // 暴露的盲点
-	DimensionScores DimensionScores `json:"dimension_scores"` // 四维分
+// WeakPoint 一条弱点。
+//
+// 为什么拆成两半，而不是像以前那样就一句话：
+//
+//	Tag    管"是哪个毛病" —— 用来数次数、跨场次对比，同一个毛病必须永远同一个名字
+//	Detail 管"这次具体怎么犯的" —— 用来看细节，可以自由写
+//
+// 只留一句话的话，第二次说同一个毛病时措辞一变，就数不上次数了
+// （这正是"32 条毛病全是 1 次"那个毛病的根）。
+type WeakPoint struct {
+	Tag    string `json:"tag"`    // 必须是标签库里的名字，由 Resolve 兜底
+	Detail string `json:"detail"` // 这次具体差在哪
+}
 
-	// Partial 不是模型给的字段，是解析器兜底时自己打的标记。
-	// true 表示这份数据含推断成分：D3 报告要标注，D7 排期要降权。
-	// [面试-架构] 兜底不能假装成功，必须留下"我猜过"的痕迹。
+// Review 只装文字。
+type Review struct {
+	Comment    string      `json:"comment"`     // 一句话评语
+	WeakPoints []WeakPoint `json:"weak_points"` // 差在哪，一条一个
+
+	// 含义同 Score.Partial。
 	Partial bool `json:"-"`
 }
 
-// ---------- 错误 ----------
-
-var (
-	// ErrNoEval 模型压根没输出表格，人话可以直接用，但这一轮没有判断。
-	ErrNoEval = errors.New("模型未输出 EVAL 块")
-	// ErrBadJSON 找到了表格但 JSON 修不好，必须降级（事后补打分）。
-	ErrBadJSON = errors.New("EVAL 块 JSON 无法解析")
+// 模型输出里，用这两对标记把两块内容框起来。
+//
+// 为什么不用 <!-- --> 这种注释来框？
+// 因为模型回答里如果出现 --> 这几个字，那一行会被从中间切断，后面的内容全丢。
+const (
+	JudgeOpen   = "<<<JUDGE"
+	JudgeClose  = "JUDGE>>>"
+	ReviewOpen  = "<<<REVIEW"
+	ReviewClose = "REVIEW>>>"
 )
 
-// ---------- 主解析入口 ----------
+// 失败分两种，处理方式不一样。
+var (
+	// ErrNoGrade：模型压根没给打分内容。这一题就没分，标成待补。
+	ErrNoGrade = errors.New("模型没给打分内容")
+	// ErrBadJSON：内容找到了，但里面写坏了，修也修不通。
+	ErrBadJSON = errors.New("打分内容读不出来")
+)
 
-// Parse 把模型的一次输出拆成两份东西：
+// ParseGrade 把模型的一次判卷回答拆成两块。
 //
-//	text —— 给用户看的人话
-//	eval —— 给程序用的表格，nil 表示彻底失败、调用方必须降级
+//	s —— 判卷结论，为 nil 表示这块没拿到
+//	r —— 文字评语，为 nil 表示这块没拿到
 //
-// 三级兜底：定界块 → 全文最后一个括号平衡对象 → 修 JSON。
-func Parse(raw string) (string, *Evaluation, error) {
-	text := raw
-	var payload string
+// 两块可能单独缺：只给了 hits 没给评语，也算成功，只是 r 为 nil。
+// 两块都没有才报 ErrNoGrade。
+func ParseGrade(raw string) (s *Score, r *Review, err error) {
+	judgePayload, hasJudge := takeBlock(raw, JudgeOpen, JudgeClose)
+	reviewPayload, hasReview := takeBlock(raw, ReviewOpen, ReviewClose)
 
-	if p, start, end, ok := blockSpan(raw); ok {
-		// 一级：标准定界块
-		text = raw[:start] + raw[end:]
-		payload = p
-	} else if p, start, end, ok := lastObjectSpan(raw); ok {
-		// 兜底 A：模型忘了写定界符，退而求其次找裸 JSON
-		text = raw[:start] + raw[end:]
-		payload = p
-	} else {
-		// 彻底失败：人话照常返回，表格交给上层事后补
-		return strings.TrimSpace(raw), nil, ErrNoEval
+	if !hasJudge && !hasReview {
+		return nil, nil, ErrNoGrade
 	}
 
-	text = strings.TrimSpace(text)
+	// 两块各自独立处理，一块坏了不影响另一块。
+	var firstErr error
 
-	var e Evaluation
-	if err := json.Unmarshal([]byte(payload), &e); err != nil {
-		// 兜底 B：JSON 本身坏了（代码围栏 / 尾逗号 / 截断）
-		if err2 := json.Unmarshal([]byte(repairJSON(payload)), &e); err2 != nil {
-			return text, nil, fmt.Errorf("%w: %v", ErrBadJSON, err)
+	if hasJudge {
+		var sc Score
+		repaired, e := unmarshalLoose(judgePayload, &sc)
+		if e != nil {
+			firstErr = e
+		} else {
+			sc.Partial = repaired
+			sc.normalize()
+			s = &sc
 		}
-		e.Partial = true
 	}
 
-	// 兜底 C：字段级缺失 / 越界
-	e.normalize()
-	return text, &e, nil
+	if hasReview {
+		var rv Review
+		repaired, e := unmarshalLoose(reviewPayload, &rv)
+		if e != nil {
+			if firstErr == nil {
+				firstErr = e
+			}
+		} else {
+			rv.Partial = repaired
+			rv.normalize()
+			r = &rv
+		}
+	}
+
+	return s, r, firstErr
 }
 
-// ---------- 定界块提取 ----------
-
-// blockSpan 取最后一个定界块并返回它在原文里的区间。
+// takeBlock 从一段话里，把这对标记框住的内容拿出来。
 //
-// [面试-细节] 取最后一个而不是第一个：prompt 里的 few-shot 示例
-// 也可能含同样的定界符，模型的复述会污染第一次匹配。
-func blockSpan(raw string) (payload string, start, end int, ok bool) {
-	closeIdx := strings.LastIndex(raw, EvalClose)
+// 找最后一对、不是第一对：我们给模型的示例里也可能有这对标记，
+// 模型有时候会把示例一起抄出来，前面那个是假的，最后面那个才是真结果。
+func takeBlock(raw, open, closeMark string) (string, bool) {
+	closeIdx := strings.LastIndex(raw, closeMark)
 	if closeIdx < 0 {
-		return "", 0, 0, false
+		return "", false
 	}
-	openIdx := strings.LastIndex(raw[:closeIdx], EvalOpen)
+	openIdx := strings.LastIndex(raw[:closeIdx], open)
 	if openIdx < 0 {
-		return "", 0, 0, false
+		return "", false
 	}
-	return strings.TrimSpace(raw[openIdx+len(EvalOpen) : closeIdx]),
-		openIdx, closeIdx + len(EvalClose), true
+	return strings.TrimSpace(raw[openIdx+len(open) : closeIdx]), true
 }
 
-// lastObjectSpan 正向扫描，记住最后一个顶层 {...} 的区间。
-//
-// [面试-细节] 必须跟踪字符串与转义状态：回答正文里的 "{" 或 "\""
-// 会让纯数括号的配对全错。
-func lastObjectSpan(s string) (payload string, start, end int, ok bool) {
-	var stack []int
-	inStr, esc := false, false
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if inStr {
-			switch {
-			case esc:
-				esc = false
-			case c == '\\':
-				esc = true
-			case c == '"':
-				inStr = false
-			}
-			continue
-		}
-		switch c {
-		case '"':
-			inStr = true
-		case '{':
-			stack = append(stack, i)
-		case '}':
-			if len(stack) == 0 {
-				continue
-			}
-			open := stack[len(stack)-1]
-			stack = stack[:len(stack)-1]
-			if len(stack) == 0 {
-				payload, start, end, ok = s[open:i+1], open, i+1, true
-			}
-		}
+// unmarshalLoose 把一段文字读进 Go 的结构。
+// 直接读不通，就简单修一下再读一次。
+// 返回值 repaired 为 true 表示"修过才读通"，调用方要给数据打记号。
+func unmarshalLoose(payload string, v any) (repaired bool, err error) {
+	if err := json.Unmarshal([]byte(payload), v); err == nil {
+		return false, nil
 	}
-	return payload, start, end, ok
+	if err := json.Unmarshal([]byte(repairJSON(payload)), v); err != nil {
+		return true, fmt.Errorf("%w: %v", ErrBadJSON, err)
+	}
+	return true, nil
 }
-
-// ---------- JSON 修复 ----------
 
 var trailingCommaRe = regexp.MustCompile(`,(\s*[}\]])`)
 
-// repairJSON 只修三种最常见坏法，修不了就原样返回、让上层报错。
+// repairJSON 只修三种常见的坏写法，修不好就原样还回去，让上面报错。
 //
-// [面试-架构] 不做全量 JSON 修复器：逞强的修复器会静默产出错数据，
-// 比直接报错危险十倍。
+// 为什么不写一个"什么都能修"的版本：
+// 修错了它不会报错，而是安安静静给你一份错数据，拿这份错数据去做判断
+// 比直接报错危险得多。
 func repairJSON(s string) string {
 	s = strings.TrimSpace(s)
+	// 坏法一：模型把整段包进了代码块
 	if strings.HasPrefix(s, "```") {
 		s = strings.TrimPrefix(s, "```json")
 		s = strings.TrimPrefix(s, "```JSON")
@@ -172,80 +176,129 @@ func repairJSON(s string) string {
 		s = strings.TrimSuffix(s, "```")
 		s = strings.TrimSpace(s)
 	}
-	// 尾逗号：{"a": 1,}
+	// 坏法二：多了一个逗号，比如 {"a": 1,}
 	s = trailingCommaRe.ReplaceAllString(s, "$1")
-	// 被截断：补右括号。这里按字符数粗补，够用即可。
+	// 坏法三：说太长了被切断，右半边少了括号，补上
 	for strings.Count(s, "{") > strings.Count(s, "}") {
 		s += "}"
 	}
 	return s
 }
 
-// ---------- 字段级归一 ----------
-
-// normalize 保证下游拿到的是"能直接用"的数据，而不只是"解析成功"。
+// normalize 把模型报的 hits 整理成能直接用的样子。
 //
-// [面试-架构] 兜底要兜到下游能安全消费为止：nil 切片序列化成 null，
-// 前端 .map() 直接崩。
-func (e *Evaluation) normalize() {
-	e.Score = clamp(e.Score, 0, 10)
-
-	d := &e.DimensionScores
-	d.TechnicalDepth = clamp(d.TechnicalDepth, 0, 10)
-	d.ProjectArticulation = clamp(d.ProjectArticulation, 0, 10)
-	d.Communication = clamp(d.Communication, 0, 10)
-	d.ProblemSolving = clamp(d.ProblemSolving, 0, 10)
-
-	sum := d.TechnicalDepth + d.ProjectArticulation + d.Communication + d.ProblemSolving
-
-	// 四个维度全 0 但总分 > 0：判定模型漏填，用总分兜底。
-	//
-	// [面试-细节] 已知取舍：int 无法区分"真 0 分"和"字段缺失"。
-	// 要严谨得用 *int，代价是每处取值都要解引用；第一版选简单。
-	if sum == 0 && e.Score > 0 {
-		d.TechnicalDepth, d.ProjectArticulation = e.Score, e.Score
-		d.Communication, d.ProblemSolving = e.Score, e.Score
-		e.Partial = true
+// 做四件事，顺序不能换：
+//  1. 去重（模型偶尔会把同一项写两遍）
+//  2. 丢掉不认识的 id，但打 Partial 记号——丢掉是防它把分拉偏，记下来是防我们不知道它胡说
+//  3. 用清理后的 hits 算档位
+//  4. 用档位算分
+func (s *Score) normalize() {
+	valid := make([]string, 0, len(s.Hits))
+	for _, id := range MergeHits(s.Hits) {
+		if _, ok := DeductionByID(id); ok {
+			valid = append(valid, id)
+		} else {
+			s.Partial = true
+		}
 	}
-	// 反过来：总分缺失但四维有值，取均值。
-	if e.Score == 0 && sum > 0 {
-		e.Score = sum / 4
-		e.Partial = true
+	s.Hits = valid
+	if s.Hits == nil {
+		// 空列表不能留成 nil：JSON 化会变成 null，前端拿去遍历就崩
+		s.Hits = []string{}
 	}
 
-	if e.WeakPoints == nil {
-		e.WeakPoints = []string{}
+	s.Tier = CombineTier(s.Hits)
+	s.Total = s.Tier.Score()
+
+	// evidence 只保留还在 hits 里的那些键，免得两边对不上（显示时找不到对应条目）
+	if len(s.Evidence) > 0 {
+		keep := make(map[string]string, len(s.Hits))
+		inHits := make(map[string]bool, len(s.Hits))
+		for _, id := range s.Hits {
+			inHits[id] = true
+		}
+		for id, v := range s.Evidence {
+			v = strings.TrimSpace(v)
+			if v == "" || !inHits[id] {
+				continue
+			}
+			keep[id] = v
+		}
+		s.Evidence = keep
 	}
 }
 
-func clamp(v, lo, hi int) int {
-	if v < lo {
-		return lo
+// normalize 把文字整理干净。
+func (r *Review) normalize() {
+	r.Comment = strings.TrimSpace(r.Comment)
+	// 弱点列表不能留空指针。它会变成 null，
+	// 前端拿到 null 再去一条条读，直接就崩了。
+	if r.WeakPoints == nil {
+		r.WeakPoints = []WeakPoint{}
 	}
-	if v > hi {
-		return hi
+	for i := range r.WeakPoints {
+		r.WeakPoints[i].Tag = strings.TrimSpace(r.WeakPoints[i].Tag)
+		r.WeakPoints[i].Detail = strings.TrimSpace(r.WeakPoints[i].Detail)
 	}
-	return v
 }
 
-// ---------- prompt 那半边 ----------
+// 协议模板里两个要运行时填进去的位置。
+const (
+	gradeTagSlot    = "<可用标签>"
+	gradeDeductSlot = "<可用扣分项>"
+)
 
-// EvalProtocol 拼进 system prompt，规定"模型怎么吐表格"。
+// gradeProtocolTemplate 是面试结束后，单独发给模型的那段话：
+// 让它对着刚才那一段问答，判断这份回答踩了哪些坑。
 //
-// [面试-架构] schema 有两端：Go struct 与这段指令必须字字对齐。
-// 只写 struct 不写指令 = tiny-agent 踩过的老坑（模型不知道有这个格式，
-// 永远不吐）。五条硬约束每一条都对应 struct 的一个字段。
-const EvalProtocol = `你每轮回复必须严格按以下结构输出，不得改动定界符：
+// 注意：这段话不会出现在聊天里。聊天那条路上模型什么都不用填。
+//
+// 硬规矩第 1 条是专门治「按篇幅打分」的。探针（testdata/golden）里量出来过：
+// 600 字的空话能拿 6 分、90 字说到点子上的只得 3 分——它是在数长度，不是在读内容。
+// 所以这条必须写在协议里，而且要在最前面，不能塞在末尾当补充说明。
+//
+// 硬规矩第 2 条是治「不敢给满分」的：不让它自己发明扣分理由，
+// 它就没有"我觉得还不够完美，扣一点"这个出口，零命中才会真的等于 A 档。
+const gradeProtocolTemplate = `下面是你和候选人的一段问答。请当考官判卷，判断这份回答踩了哪些坑。
 
-<你的追问或反馈，用中文；先说内容，不要在这里提分数>
+硬规矩：
+1. 篇幅长短完全不参与判断。写得长不等于答得好，写得短不等于答得差。
+   通篇空话的长回答该扣照样扣，两句话说到点子上的短回答不该扣。
+2. 只判断下面列出的这几条。不要自己发明扣分理由，不要因为「不够完美」就多加。
+3. 一条都没踩就是 []。这是正常情况，好回答本来就不该有扣分项。
 
-<<<EVAL
-{"score": 7, "should_advance": true, "weak_points": ["没量化项目收益"], "dimension_scores": {"technical_depth": 7, "project_articulation": 5, "communication": 8, "problem_solving": 6}}
-EVAL>>>
+<<<JUDGE
+{"hits": ["name_only", "no_number"], "evidence": {"name_only": "通篇只说了这个名词在做什么"}}
+JUDGE>>>
 
-硬约束：
-1. 定界符原样写成 <<<EVAL 和 EVAL>>>，不许改成代码块，也不许用 HTML 注释。
-2. JSON 是单行合法 JSON，不带尾逗号，引号一律用普通双引号。
-3. score 为 0-10 的整数；四个维度必须全部填写，不许省略。
-4. should_advance 只表示"是否进入下一阶段"，不要输出阶段名。
-5. weak_points 只写"能力缺陷"（如"没量化项目收益"），不写"这题没答好"。`
+<<<REVIEW
+{"comment": "答得偏浅，只讲了怎么做没讲为什么", "weak_points": [{"tag": "表达/只讲做了什么没讲为什么", "detail": "讲了用了什么方案，没讲为什么不用别的"}]}
+REVIEW>>>
+
+必须遵守：
+1. 两块标记原样写，不许改成代码块，也不许用 HTML 注释。
+2. 每块里是一行能直接读的 JSON，结尾不要多逗号，引号用普通双引号。
+3. hits 里每个 id 必须从下面这份扣分项清单里原样抄一个：
+   一个字都不许改、不许加括号备注、不许自己造近义词。
+4. evidence 可以只写一部分，也可以写 {}；写了就要贴原文，一句话。
+5. weak_points 写 1 到 3 条，确实没有明显毛病就写 []。
+   写能力上的毛病，不要写"这题没答好"这种。
+6. 每条的 tag 必须从下面这份标签清单里原样挑一个：一个字都不许改、
+   不许加括号备注、不许加后缀、不许自己造近义词。
+   实在没有一个对得上，tag 就写 "未归类"。
+7. 每条的 detail 写这次具体差在哪，一句话，要能让人照着复盘。
+
+可用扣分项：
+<可用扣分项>
+
+可用标签：
+<可用标签>`
+
+// GradeSystemPrompt 拼出完整的判卷提示词（协议 + 扣分项清单 + 标签清单）。
+//
+// 两份清单都是运行时填进去的，不写死在模板里——
+// 以后加标签只改 tags.txt，调扣分项只改 rubric.go，都不用动这段提示词。
+func GradeSystemPrompt(tags *TagBook) string {
+	s := strings.Replace(gradeProtocolTemplate, gradeDeductSlot, DeductionPromptList(), 1)
+	return strings.Replace(s, gradeTagSlot, tags.PromptList(), 1)
+}
