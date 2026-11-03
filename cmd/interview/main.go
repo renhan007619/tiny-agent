@@ -48,11 +48,65 @@ func main() {
 	}
 	defer store.Close()
 
-	startedAt := time.Now()
-	session := interview.NewSession(startedAt.Format("20060102-150405"), startedAt)
-	if err := store.CreateSession(session.ID, startedAt); err != nil {
-		fmt.Fprintln(os.Stderr, "建场次失败:", err)
-		os.Exit(1)
+	// scanner 提到这里：问"要不要接着面"要用它读一行。
+	// 原来它在下面 grader 之后才建，那时候已经来不及了。
+	scanner := bufio.NewScanner(os.Stdin)
+
+	var (
+		session *interview.Session
+		resumed bool
+	)
+
+	// 先把"有内容但没结束"的场次列出来，让人自己挑。
+	//
+	// 为什么不替你选：最后一条可能是一次误触（开了场立刻退），
+	// 真正面到一半的是倒数第二条。候选通常就一两条，
+	// 编号挑一次的成本远低于猜错的成本。
+	open, err := store.FindOpenSessions()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "（查未完成场次失败，按新的一场开：", err, "）")
+	}
+
+	switch len(open) {
+	case 0:
+		// 没有可续的，直接开新场，不打扰人。
+	case 1:
+		o := open[0]
+		fmt.Printf("上次（%s 开始 · 已问 %d 题 · 已答 %d 题）没结束，接着面吗？[Y/n] ",
+			o.StartedAt.Format("01-02 15:04"), o.Turns, o.Answered)
+		if scanner.Scan() {
+			line := strings.ToLower(strings.TrimSpace(scanner.Text()))
+			if line != "n" { // 空回车也算续：绝大多数时候是想续的
+				resumed = true
+				session = resumeSession(store, o.ID, o.StartedAt)
+			}
+		}
+	default:
+		fmt.Println("发现几场没结束的面试：")
+		for i, o := range open {
+			fmt.Printf("  %d) %s 开始 · 已问 %d 题 · 已答 %d 题\n",
+				i+1, o.StartedAt.Format("01-02 15:04"), o.Turns, o.Answered)
+		}
+		fmt.Print("续哪一场？（输序号，n 开新场）")
+		if scanner.Scan() {
+			var pick int
+			if _, err := fmt.Sscan(strings.TrimSpace(scanner.Text()), &pick); err == nil &&
+				pick >= 1 && pick <= len(open) {
+				o := open[pick-1]
+				resumed = true
+				session = resumeSession(store, o.ID, o.StartedAt)
+			}
+		}
+	}
+
+	// 没接着面，就正常开一场新的。
+	if session == nil {
+		startedAt := time.Now()
+		session = interview.NewSession(startedAt.Format("20060102-150405"), startedAt)
+		if err := store.CreateSession(session.ID, startedAt); err != nil {
+			fmt.Fprintln(os.Stderr, "建场次失败:", err)
+			os.Exit(1)
+		}
 	}
 
 	ctx := context.Background()
@@ -61,11 +115,27 @@ func main() {
 	grader := interview.NewGrader(chatter, store, tags, session.ID)
 	grader.Start(ctx)
 
-	scanner := bufio.NewScanner(os.Stdin)
+	// 接着面的话，把上次欠下的打分补上。
+	// 补的是"已经答过但没算分"的题，不是重新答题——所以不会漏东西。
+	if resumed {
+		owe, err := store.LoadUngradedTurns(session.ID)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "（查欠打分失败：", err, "）")
+		}
+		for _, t := range owe {
+			grader.Submit(t)
+		}
+		if len(owe) > 0 {
+			fmt.Printf("补打 %d 道题的分数（后台算，不耽误你继续答）\n", len(owe))
+		}
+		if session.Over() {
+			fmt.Println("上次那场题已经问完了，补完分直接出报告。")
+		}
+	}
 
 	fmt.Printf("模拟面试官就绪 | 模型=%s | 场次=%s | 标签 %d 个 | 全场最多 %d 题\n",
 		model, session.ID, len(tags.All()), interview.MaxQuestions)
-	fmt.Println("（打完一句话按回车提交，Ctrl+C 退出）")
+	fmt.Println("（打完一句话按回车提交；Ctrl+C 退出，下次启动可以接着面）")
 
 	for !session.Over() {
 		// 每轮 60 秒超时：模型那边卡住时，宁可报错也别一直干等。
@@ -100,12 +170,22 @@ func main() {
 		grader.Submit(session.Turns[len(session.Turns)-1])
 	}
 
-	if err := store.EndSession(session.ID, time.Now()); err != nil {
-		fmt.Fprintln(os.Stderr, "（收尾失败：", err, "）")
+	// 只有"题问够了"才算这场结束。
+	//
+	// 中途退出（模型出错、Ctrl+Z、Ctrl+C）绝不能标结束——那正是下次要续的场次。
+	// 之前这里是无条件 EndSession，等于"一中断就宣告作废"，
+	// 续接功能上线后这就是个致命 bug：面到一半 API 抖一下，整场就再也捡不回来了。
+	if session.Over() {
+		if err := store.EndSession(session.ID, time.Now()); err != nil {
+			fmt.Fprintln(os.Stderr, "（收尾失败：", err, "）")
+		}
+		fmt.Println()
+		fmt.Printf("面试结束（共 %d 题），等最后几题算完…\n", session.Total())
+	} else {
+		fmt.Println()
+		fmt.Println("（这场没面完，已经存住了；下次启动可以接着面）")
+		fmt.Printf("已完成 %d 题，等已经交上去的打分算完…\n", session.Total())
 	}
-
-	fmt.Println()
-	fmt.Printf("面试结束（共 %d 题），等最后几题算完…\n", session.Total())
 	grader.Wait()
 
 	// 报告从库里重新读一遍再出——你看到的，就是下次打开还能看到的。
@@ -123,6 +203,25 @@ func main() {
 	}
 
 	fmt.Print(interview.Report(session, weak))
+}
+
+// resumeSession 把库里那场读回来。读不出来返回 nil，调用方会退回开新场。
+//
+// 注意这里只喂了 Turns 一个字段：阶段、题号、这个阶段问了几题，
+// 全由它自己从 Turns 算出来。这是"状态不存、从事实派生"最直接的回报。
+func resumeSession(store *interview.Store, id string, startedAt time.Time) *interview.Session {
+	turns, err := store.LoadTurns(id)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "（读回上次记录失败，按新的一场开：", err, "）")
+		return nil
+	}
+	if len(turns) == 0 {
+		fmt.Fprintln(os.Stderr, "（上次那场没读到任何题目，按新的一场开）")
+		return nil
+	}
+	s := interview.NewSession(id, startedAt)
+	s.Turns = turns
+	return s
 }
 
 // loadEnv 读 .env，一行一个 KEY=VALUE。

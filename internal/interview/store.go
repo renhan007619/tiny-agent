@@ -372,6 +372,113 @@ func (s *Store) LoadTurns(sessionID string) ([]Turn, error) {
 	return out, rows.Err()
 }
 
+// OpenSession 是一场"开了但没结束"的面试，带着能不能续的判断依据。
+//
+// Turns / Answered 是给人看的，不是给代码下判断用的：
+// 「已答 0 题」几乎一定是一次误触，这比任何时间阈值都准，也不会过期。
+type OpenSession struct {
+	ID         string
+	StartedAt  time.Time
+	LastActive time.Time // 最后一次往这场里写字的时间（答题或打分都算）
+	Turns      int       // 问了几题
+	Answered   int       // 答了几题
+}
+
+// FindOpenSessions 找出所有"有内容但没结束"的面试，最近动过的排前面。
+//
+// 为什么不是只取最后一条：最后一条可能是一次误触（开了场立刻退），
+// 而真正面到一半的是倒数第二条。所以不猜，全列出来交给用户挑。
+//
+// 为什么按 last_active 排而不按 started_at：人一次只面一场，
+// 想续的几乎总是最近动过的那场；只按开始时间排，遇到"开了一场挂在旁边很久"
+// 就会选错。
+//
+// HAVING answered > 0 是唯一一条硬过滤：一题都没答过的场次没有续的价值。
+// 它必须写在 HAVING 而不是 WHERE——它是聚合之后才能算的条件。
+func (s *Store) FindOpenSessions() ([]OpenSession, error) {
+	rows, err := s.db.Query(
+		`SELECT s.id, s.started_at,
+		        COALESCE(MAX(t.updated_at), s.started_at) AS last_active,
+		        COUNT(t.idx) AS turns,
+		        SUM(CASE WHEN t.answer <> '' THEN 1 ELSE 0 END) AS answered
+		   FROM session s
+		   LEFT JOIN turn t ON t.session_id = s.id
+		  WHERE s.status = 'ongoing'
+		  GROUP BY s.id, s.started_at
+		 HAVING answered > 0
+		  ORDER BY last_active DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []OpenSession
+	for rows.Next() {
+		var (
+			o                  OpenSession
+			started, lastActive string
+			answered           sql.NullInt64 // LEFT JOIN 没配上 turn 时 SUM 是 NULL
+		)
+		if err := rows.Scan(&o.ID, &started, &lastActive, &o.Turns, &answered); err != nil {
+			return nil, err
+		}
+		o.StartedAt = parseTime(started)
+		o.LastActive = parseTime(lastActive)
+		o.Answered = int(answered.Int64)
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
+// LoadUngradedTurns 找出这一场里"欠着一次打分"的题。
+//
+// 判据只有两条：答过（answer 不为空）、分数没有终局（grade 不是 done/skipped）。
+//
+// 为什么 running 也算欠：进程被打断时那题停在 running，
+// 它的分其实没算完。不重打，报告里会永远显示"打分中"。
+//
+// 为什么用参数传常量而不在 SQL 里写死 'done'/'skipped'：
+// 常量将来改名，这里跟着变，不会偷偷漏掉一类题。
+func (s *Store) LoadUngradedTurns(sessionID string) ([]Turn, error) {
+	rows, err := s.db.Query(
+		`SELECT idx, stage, question, answer, grade, grade_err
+		   FROM turn
+		  WHERE session_id = ?
+		    AND answer <> ''
+		    AND grade NOT IN (?, ?)
+		  ORDER BY idx`,
+		sessionID, string(GradeDone), string(GradeSkipped))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Turn
+	for rows.Next() {
+		var (
+			t     Turn
+			stage int // Stage 是 int 的别名，Scan 不认，得先接成 int 再转
+		)
+		if err := rows.Scan(&t.Index, &stage, &t.Question, &t.Answer,
+			&t.Grade, &t.GradeErr); err != nil {
+			return nil, err
+		}
+		t.Stage = Stage(stage)
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// parseTime 解析库里存的 RFC3339 文本，坏了就退回"现在"。
+// 时间只是显示用的信息，不该因为一个坏字符串把整场面试拦在门外。
+func parseTime(s string) time.Time {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Now()
+	}
+	return t
+}
+
 // Close 关掉数据库。
 func (s *Store) Close() error {
 	return s.db.Close()
