@@ -184,3 +184,25 @@ func (s *Session) History() []Message {
 	}
 	return out
 }
+
+// StageQuota 是"某个阶段该问几题"的只读视图。
+//
+// 为什么要有它：stagePlan 是包内私有变量，外部（比如轨迹体检）想按配额
+// 判违规却拿不到它。开一个只读窗口，比把 stagePlan 整个导出安全——
+// 导出变量谁都能改，导出函数只能读。
+type StageQuota struct {
+	Stage Stage
+	Name  string
+	Quota int
+}
+
+// StageQuotas 返回全部阶段的配额，按顺序。
+//
+// 返回的是新切片：调用方 append 或者改元素，都碰不到 stagePlan 本身。
+func StageQuotas() []StageQuota {
+	out := make([]StageQuota, len(stagePlan))
+	for i, p := range stagePlan {
+		out[i] = StageQuota{Stage: Stage(i), Name: p.Name, Quota: p.Quota}
+	}
+	return out
+}

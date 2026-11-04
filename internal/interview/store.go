@@ -479,6 +479,46 @@ func parseTime(s string) time.Time {
 	return t
 }
 
+// SessionBrief 是一场面试的小档案，全量体检用它遍历。
+type SessionBrief struct {
+	ID        string
+	StartedAt time.Time
+	Finished  bool
+	Turns     int
+}
+
+// ListSessions 列出所有场次，最近开的排前面。
+//
+// 题数用相关子查询现算，不落成字段：它和 turn 表是同一个事实的两种看法，
+// 存两处迟早对不上。
+func (s *Store) ListSessions() ([]SessionBrief, error) {
+	rows, err := s.db.Query(
+		`SELECT s.id, s.started_at, s.status,
+		        (SELECT COUNT(*) FROM turn t WHERE t.session_id = s.id)
+		   FROM session s
+		  ORDER BY s.started_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []SessionBrief
+	for rows.Next() {
+		var (
+			b    SessionBrief
+			at   string
+			stat string
+		)
+		if err := rows.Scan(&b.ID, &at, &stat, &b.Turns); err != nil {
+			return nil, err
+		}
+		b.StartedAt = parseTime(at)
+		b.Finished = stat == "finished"
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
 // Close 关掉数据库。
 func (s *Store) Close() error {
 	return s.db.Close()
