@@ -1,0 +1,32 @@
+[
+  {
+    "query": "分块策略和向量数据库怎么选",
+    "file": "agent面经.md",
+    "must": "分块策略",
+    "note": "示例：来源 agent面经.md T2 第4题，需人工核对后确认"
+  },
+  {
+    "query": "进程 线程 协程 有什么区别 能用多核吗",
+    "file": "agent面经.md",
+    "must": "多核",
+    "note": "示例：来源 agent面经.md T2 第3题，需人工核对后确认"
+  },
+  {
+    "query": "RAG 的效果怎么评测",
+    "file": "agent面经.md",
+    "must": "RAG 的效果",
+    "note": "示例：来源 agent面经.md T3 第2题，需人工核对后确认"
+  },
+  {
+    "query": "上下文被截断了怎么办",
+    "file": "agent面经.md",
+    "must": "截断了",
+    "note": "示例：来源 agent面经.md T1 第7题，需人工核对后确认"
+  },
+  {
+    "query": "怎么设计降级策略",
+    "file": "agent面经.md",
+    "must": "降级策略",
+    "note": "示例：来源 agent面经.md T1 第9题，需人工核对后确认"
+  }
+]
