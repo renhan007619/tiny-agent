@@ -33,8 +33,8 @@ func OpenStore(path string) (*Store, error) {
 		return nil, fmt.Errorf("设置 busy_timeout 失败: %w", err)
 	}
 
-	// 三张表：场次 / 每道题 / 弱点累计（跨场次）
-	for _, q := range []string{schemaSession, schemaTurn, schemaWeakPoint} {
+	// 四张表：场次 / 每道题 / 弱点累计（跨场次）/ 复习排期
+	for _, q := range []string{schemaSession, schemaTurn, schemaWeakPoint, schemaReview} {
 		if _, err := db.Exec(q); err != nil {
 			db.Close()
 			return nil, fmt.Errorf("建表失败: %w", err)
@@ -53,12 +53,20 @@ func OpenStore(path string) (*Store, error) {
 
 // migrate 给老库补上后来新增的列。
 //
-// 现在只补 tier 和 hits（扣分制改造加的）。
+// 现在补 tier、hits（扣分制改造加的）和 grade_raw（重放改造加的）。
 // 以后再加列，往下面这张表里加一行就行，别的都不用动。
 func (s *Store) migrate() error {
 	adds := []struct{ name, ddl string }{
 		{"tier", `ALTER TABLE turn ADD COLUMN tier TEXT`},
 		{"hits", `ALTER TABLE turn ADD COLUMN hits TEXT NOT NULL DEFAULT '[]'`},
+		// grade_raw：模型当时返回的原文，原样存。
+		//
+		// 它是"回放"的唯一原料——没有它，改了解析逻辑只能重跑一场，
+		// 而重跑的结果和你上次跑的不是同一份，比了也说明不了问题。
+		//
+		// 为什么现在就要加、不能等有空再补：这一列从加上的那一刻才开始攒，
+		// 加得越晚，能回放的存量越少。
+		{"grade_raw", `ALTER TABLE turn ADD COLUMN grade_raw TEXT NOT NULL DEFAULT ''`},
 	}
 	for _, a := range adds {
 		if s.hasColumn("turn", a.name) {
@@ -137,6 +145,7 @@ const schemaTurn = `CREATE TABLE IF NOT EXISTS turn (
 	comment    TEXT    NOT NULL DEFAULT '',
 	weak       TEXT    NOT NULL DEFAULT '[]',
 	grade_err  TEXT    NOT NULL DEFAULT '',
+	grade_raw  TEXT    NOT NULL DEFAULT '',
 	updated_at TEXT    NOT NULL,
 	PRIMARY KEY (session_id, idx)
 )`
@@ -204,7 +213,10 @@ func (s *Store) SaveAnswer(sessionID string, idx int, answer string) error {
 //
 // 注意 depth/project/talk/solve 四列不再写入——它们属于旧的"四维自由打分"，
 // 新数据的这四列是 NULL。老数据那几场仍然读得出来，因为列还在。
-func (s *Store) SaveGrade(sessionID string, idx int, g GradeState, sc *Score, rv *Review, errText string) error {
+// raw 是模型这次的原始返回，原样存下来给回放用。
+// 没调模型的场合（反问、空答案）传空字符串——这一列是 NOT NULL，
+// 不能像分数那样用 any 传 nil。
+func (s *Store) SaveGrade(sessionID string, idx int, g GradeState, sc *Score, rv *Review, errText, raw string) error {
 	// 用 any 是为了没分数时能真的写 NULL，而不是写 0。
 	var total, tier any
 	hits := "[]"
@@ -236,10 +248,10 @@ func (s *Store) SaveGrade(sessionID string, idx int, g GradeState, sc *Score, rv
 
 	_, err := s.db.Exec(
 		`UPDATE turn SET grade = ?, total = ?, tier = ?, hits = ?,
-		        partial = ?, comment = ?, weak = ?, grade_err = ?, updated_at = ?
+		        partial = ?, comment = ?, weak = ?, grade_err = ?, grade_raw = ?, updated_at = ?
 		 WHERE session_id = ? AND idx = ?`,
 		string(g), total, tier, hits,
-		partial, comment, weak, errText, nowText(), sessionID, idx)
+		partial, comment, weak, errText, raw, nowText(), sessionID, idx)
 	return err
 }
 
@@ -263,7 +275,19 @@ func (s *Store) UpsertWeakPoint(tag, detail, rawTag, sessionID string, idx int) 
 		   last_idx     = excluded.last_idx,
 		   last_seen    = excluded.last_seen`,
 		tag, detail, rawTag, sessionID, idx, now, now)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// 新标签顺手挂上复习排期；已经排过期的保持原样，练习进度不能被冲掉。
+	//
+	// 这里不包事务：万一账本记下了、排期没挂上，下次再犯同一个毛病会自动补上
+	// ——因为 StartReview 是幂等的（DO NOTHING）。
+	// 为一个能自愈的状态去加事务，属于把简单问题复杂化。
+	if err := s.StartReview(tag, time.Now()); err != nil {
+		return err
+	}
+	return nil
 }
 
 // WeakStat 是一个标签的累计情况。
@@ -332,9 +356,9 @@ func (s *Store) LoadTurns(sessionID string) ([]Turn, error) {
 
 		if total.Valid {
 			sc := &Score{
-				Total:   int(total.Int64),
-				Partial: partial == 1,
-				Hits:    []string{},
+				Total:    int(total.Int64),
+				Partial:  partial == 1,
+				Hits:     []string{},
 				Evidence: map[string]string{},
 			}
 
@@ -415,9 +439,9 @@ func (s *Store) FindOpenSessions() ([]OpenSession, error) {
 	var out []OpenSession
 	for rows.Next() {
 		var (
-			o                  OpenSession
+			o                   OpenSession
 			started, lastActive string
-			answered           sql.NullInt64 // LEFT JOIN 没配上 turn 时 SUM 是 NULL
+			answered            sql.NullInt64 // LEFT JOIN 没配上 turn 时 SUM 是 NULL
 		)
 		if err := rows.Scan(&o.ID, &started, &lastActive, &o.Turns, &answered); err != nil {
 			return nil, err
@@ -465,6 +489,96 @@ func (s *Store) LoadUngradedTurns(sessionID string) ([]Turn, error) {
 		}
 		t.Stage = Stage(stage)
 		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// RawGrade 是一条"有原始判词"的记录，回放用。
+//
+// 它把三样东西凑在一起：
+//
+//	Raw    —— 模型当时说了什么（证据，唯一不可重建的东西）
+//	Answer —— 候选人的回答（代码预检 CheckByCode 要用；没有它就没法重算 hits）
+//	Old... —— 当时算出来的结论（对照的基线）
+type RawGrade struct {
+	SessionID string
+	Index     int
+	Question  string
+	Answer    string
+	Raw       string
+
+	OldTier  Tier
+	OldTotal int
+	// OldTotalValid 说明"当时真的存过分"。
+	//
+	// 为什么必须有它：total 这列允许 NULL（没打成就是 NULL），
+	// 而读出来之后 int 是 0。不分清的话，"没存"会被当成"考了 0 分"，
+	// 平均分基线被拉低，算出来的涨跌幅虚高——存量老数据越多虚得越厉害。
+	OldTotalValid bool
+	OldHits       []string
+}
+
+// LoadRawGrades 读出所有能回放的题。sessionID 传空字符串表示全部场次。
+//
+// 为什么只挑「grade_raw 不为空」的：改造之前的数据没有原文，回放不了。
+// 这不是 bug，是"先存证据才有回放"的必然结果——所以这一列越早加越好，
+// 它从今天起才开始攒。
+func (s *Store) LoadRawGrades(sessionID string) ([]RawGrade, error) {
+	q := `SELECT session_id, idx, question, answer, grade_raw, tier, total, hits
+	        FROM turn
+	       WHERE grade_raw <> ''`
+	args := []any{}
+	if sessionID != "" {
+		q += ` AND session_id = ?`
+		args = append(args, sessionID)
+	}
+	q += ` ORDER BY session_id, idx`
+
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []RawGrade
+	for rows.Next() {
+		var (
+			r     RawGrade
+			tier  sql.NullString
+			total sql.NullInt64
+			hits  string
+		)
+		if err := rows.Scan(&r.SessionID, &r.Index, &r.Question, &r.Answer,
+			&r.Raw, &tier, &total, &hits); err != nil {
+			return nil, err
+		}
+
+		// total 是"可以没有"的列，所以用 NullInt64 读，
+		// 并且把 Valid 一起留下来——它决定了这条能不能进平均分统计。
+		r.OldTotalValid = total.Valid
+		if total.Valid {
+			r.OldTotal = int(total.Int64)
+		}
+
+		// 老数据没有 tier 列，用分数换算一个出来，保证新旧能对上。
+		if tier.Valid {
+			if t, ok := ParseTier(tier.String); ok {
+				r.OldTier = t
+			}
+		}
+		// 注意顺序：只有"当时真的存过分"才允许用分数倒推档位。
+		// total 是 NULL 时倒推会得到 0 分 → E 档，那是凭空造出来的基线，
+		// 会让回放报出一堆假的"档位变化"。
+		if r.OldTier == "" && r.OldTotalValid {
+			r.OldTier = TierFromScore(r.OldTotal)
+		}
+
+		// hits 解析失败就当空，不让一条坏 JSON 挡住整批回放。
+		if err := json.Unmarshal([]byte(hits), &r.OldHits); err != nil {
+			r.OldHits = nil
+		}
+
+		out = append(out, r)
 	}
 	return out, rows.Err()
 }
