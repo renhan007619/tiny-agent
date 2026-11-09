@@ -64,10 +64,12 @@ func (c *ClaudeChatter) Ask(ctx context.Context, systemPrompt string, history []
 
 	resp, err := c.client.Messages.New(ctx, anthropic.MessageNewParams{
 		Model: anthropic.Model(c.model),
-		// 2048 而不是 1024：deepseek-v4-flash 这类推理模型会先写思考过程，
-		// 思考块和正文块共用同一个额度。给 1024 时思考一旦写长，正文就是空的，
-		// 表现成"模型一个字都没说"（实测 15 条用例里挂了 3 条）。
-		MaxTokens: 2048,
+		// 8192 而不是 1024 或 2048：deepseek-v4-flash 是推理模型，
+		// 思考块和正文块共用这一个额度，而且是「写满为止」——
+		// 给 1024 时实测 15 条挂 3 条，给 2048 时判卷任务 31 条挂 23 条，
+		// stop_reason 都是 max_tokens、返回块只有 thinking、正文 0 字。
+		// 判卷提示词越细，它想得越长，所以这个数不能贴着当前实测值给。
+		MaxTokens: 8192,
 		System:    []anthropic.TextBlockParam{{Text: systemPrompt}},
 		Messages:  msgs,
 	})
@@ -82,7 +84,25 @@ func (c *ClaudeChatter) Ask(ctx context.Context, systemPrompt string, history []
 		}
 	}
 	if sb.Len() == 0 {
-		return "", fmt.Errorf("模型一个字都没说")
+		// 空返回有三种死法，光看"没说话"分不出来是哪一种：
+		//   思考把额度吃光了（stop_reason=max_tokens，正文 0 字）
+		//   中转给了个空壳（块数是 0）
+		//   只回了 thinking 块、没有 text 块（块数不是 0 但类型对不上）
+		// 不把这几个数带出来，下次看到同一句话还是不知道往哪查。
+		return "", fmt.Errorf("模型一个字都没说（stop_reason=%s 输出=%d token 返回=%d 块 类型=%s 输入=%d token）",
+			resp.StopReason, resp.Usage.OutputTokens, len(resp.Content), blockTypes(resp.Content), resp.Usage.InputTokens)
 	}
 	return strings.TrimSpace(sb.String()), nil
+}
+
+// blockTypes 把"这次到底回了什么块"列出来，比如 [thinking text]。
+func blockTypes(blocks []anthropic.ContentBlockUnion) string {
+	if len(blocks) == 0 {
+		return "[]"
+	}
+	names := make([]string, 0, len(blocks))
+	for _, b := range blocks {
+		names = append(names, string(b.Type))
+	}
+	return "[" + strings.Join(names, " ") + "]"
 }

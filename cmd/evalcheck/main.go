@@ -238,26 +238,32 @@ func printSummary(cases []GoldenCase, all map[string][]runResult, runs int) {
 	}
 
 	fmt.Println("=== 汇总 ===")
-	fmt.Println("\n【五档平均分】理想情况是严格递减")
+	fmt.Println("\n【五档平均分】理想情况是严格递增（差最低，好最高）")
 	for _, q := range qualityOrder {
 		fmt.Printf("  %-3s  %4.1f 分  (%d 条)\n", q, avg(byQuality[q]), len(byQuality[q]))
 	}
 
-	// 单调性：中间档乱序说明它分不开真实水平
+	// 单调性：分数应该随质量档一路往上（差 < 中下 < 中 < 中上 < 好）。
+	//
+	// 注意方向：qualityOrder 是从差排到好，所以后一档的分必须比前一档高。
+	// 这里曾经写成 a >= prev 才算乱序，等于把「正常涨上去」当成错误——
+	// 越准反而报的乱序越多，基线那句「2 处乱序」就是这么来的假数。
+	//
+	// 中间出现回退说明它分不开真实水平：比中下还差的回答，反而拿了更高的分。
 	prev, breaks := -1.0, 0
 	for _, q := range qualityOrder {
 		if len(byQuality[q]) == 0 {
 			continue
 		}
 		a := avg(byQuality[q])
-		if prev >= 0 && a >= prev {
+		if prev >= 0 && a <= prev {
 			breaks++
 		}
 		prev = a
 	}
-	mono := "✓ 严格递减"
+	mono := "✓ 严格递增"
 	if breaks > 0 {
-		mono = fmt.Sprintf("✗ 有 %d 处不递减（中间档分不开）", breaks)
+		mono = fmt.Sprintf("✗ 有 %d 处不递增（中间档分不开）", breaks)
 	}
 	fmt.Printf("  单调性：%s\n", mono)
 

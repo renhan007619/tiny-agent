@@ -271,9 +271,15 @@ func CheckByCode(answer string) []string {
 //
 // 顺序必须稳定：同样的输入要得到同样的档位。不然同一段回答跑两次
 // 分数不一样，这个工具就没法用来判断自己有没有进步。
+//
+// 返回的永远是空切片而不是 nil，哪怕一条都没命中。
+// 为什么：这个结果会被 JSON 化存进库，nil 会变成 null，
+// 下游拿去遍历就崩。空切片化成 []，谁都安全。
+// 这条兜底放在这里，是因为所有路径（normalize、GradeFromRaw、CombineTier）
+// 最后都要过这个函数——在这里堵一次，比在每个调用点各写一遍可靠。
 func MergeHits(groups ...[]string) []string {
 	seen := make(map[string]bool)
-	var out []string
+	out := make([]string, 0, 4)
 	for _, g := range groups {
 		for _, id := range g {
 			if seen[id] {

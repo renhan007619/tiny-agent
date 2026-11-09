@@ -13,6 +13,7 @@ type TagHit struct {
 	SessionID string
 	Index     int
 	Tier      Tier
+	Depth     int // 那次讲到第几层，0 = 没记录
 }
 
 // TagTrend 是一个标签的全部出现记录，按时间从早到晚排好。
@@ -74,7 +75,7 @@ func (t TagTrend) Path() string {
 // 因为 weak_point 只留了「最近一次」，要看走势必须有完整历史，那只有 turn 有。
 func (s *Store) LoadTagTrends() (map[string]TagTrend, error) {
 	rows, err := s.db.Query(
-		`SELECT session_id, idx, updated_at, tier, total, weak
+		`SELECT session_id, idx, updated_at, tier, total, weak, depth_reached
 		   FROM turn
 		  WHERE weak <> '[]'
 		  ORDER BY updated_at ASC, session_id ASC, idx ASC`)
@@ -92,8 +93,9 @@ func (s *Store) LoadTagTrends() (map[string]TagTrend, error) {
 			tier  sql.NullString
 			total sql.NullInt64
 			weak  string
+			depth sql.NullInt64
 		)
-		if err := rows.Scan(&sid, &idx, &at, &tier, &total, &weak); err != nil {
+		if err := rows.Scan(&sid, &idx, &at, &tier, &total, &weak, &depth); err != nil {
 			return nil, err
 		}
 
@@ -117,13 +119,19 @@ func (s *Store) LoadTagTrends() (map[string]TagTrend, error) {
 		}
 
 		ts := parseTime(at)
+		dep := 0
+		if depth.Valid {
+			dep = int(depth.Int64)
+		}
 		for _, w := range wps {
 			if w.Tag == "" {
 				continue
 			}
 			t := out[w.Tag]
 			t.Tag = w.Tag
-			t.Hits = append(t.Hits, TagHit{At: ts, SessionID: sid, Index: idx, Tier: tr})
+			t.Hits = append(t.Hits, TagHit{
+				At: ts, SessionID: sid, Index: idx, Tier: tr, Depth: dep,
+			})
 			out[w.Tag] = t
 		}
 	}

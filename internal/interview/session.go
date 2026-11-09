@@ -74,6 +74,12 @@ type Session struct {
 	ID        string
 	StartedAt time.Time
 	Turns     []Turn
+
+	// Focus 是本场重点考点，开场挑一次，之后不再变。
+	//
+	// 为什么"不再变"很重要：每轮 Prompt 都会重新拼一遍，
+	// 如果这内容每轮都动，提示词前缀就一直在变，缓存全作废。
+	Focus []FocusPoint
 }
 
 // NewSession 开一场新面试。
@@ -141,12 +147,19 @@ func (s *Session) Prompt() string {
 		)
 	}
 
-	return fmt.Sprintf(
+	base := fmt.Sprintf(
 		"你是一名严格但公正的校招面试官，方向是 Go 后端。\n"+
 			"当前阶段：%s（第 %d 阶段，共 %d 阶段），这个阶段还要问 %d 个问题。\n"+
 			"规矩：一次只问一个问题；候选人答完，你先用一句话点评，再问下一个；不许替候选人回答。",
 		plan.Name, int(st)+1, len(stagePlan), left,
 	)
+
+	// 重点只贴在"我出题"的阶段。反问环节是候选人提问，
+	// 那时考官不该带着"要考他什么"的心思，所以上面那个分支提前返回、走不到这儿。
+	if brief := FocusBrief(s.Focus); brief != "" {
+		return base + "\n" + brief
+	}
+	return base
 }
 
 // AddQuestion 记下模型刚问出的那句话。

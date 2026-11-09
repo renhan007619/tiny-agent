@@ -36,6 +36,13 @@ func Report(s *Session, weak []WeakStat) string {
 				fmt.Fprintf(&b, "  分：%s 档（%d/10）%s\n",
 					t.Score.Tier, t.Score.Total, partialMark(t.Score.Partial))
 
+				// L2：讲到第几层。它和档位是两回事——
+				// 零命中能拿 A 档，但也可能只讲到第 2 层（边界没提）。
+				fmt.Fprintf(&b, "  深：%s\n", depthText(t.Score.Depth))
+				if t.Score.Suspect != "" {
+					fmt.Fprintf(&b, "  疑：%s\n", oneLine(t.Score.Suspect))
+				}
+
 				if len(t.Score.Hits) == 0 {
 					fmt.Fprintln(&b, "  扣分：无（这条回答没踩坑）")
 				} else {
@@ -146,6 +153,23 @@ func partialMark(p bool) string {
 		return "〔含修补值〕"
 	}
 	return ""
+}
+
+// depthText 把层数翻成人话。
+//
+// 0 单独一支：它不是"第 0 层"，而是"这题没判出层次"——
+// 老数据、或者模型没填，都会是 0。把它说成"第 0 层"会让人以为有个负分档。
+func depthText(d int) string {
+	switch d {
+	case 1:
+		return "第 1 层——只说了是什么"
+	case 2:
+		return "第 2 层——讲了为什么 / 怎么做"
+	case 3:
+		return "第 3 层——连边界和取舍也讲了"
+	default:
+		return "未判定"
+	}
 }
 
 func gradeNote(t Turn) string {

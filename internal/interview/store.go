@@ -67,6 +67,13 @@ func (s *Store) migrate() error {
 		// 为什么现在就要加、不能等有空再补：这一列从加上的那一刻才开始攒，
 		// 加得越晚，能回放的存量越少。
 		{"grade_raw", `ALTER TABLE turn ADD COLUMN grade_raw TEXT NOT NULL DEFAULT ''`},
+		// L2 事件层两列。
+		//
+		// depth_reached 故意不加 NOT NULL DEFAULT 0：
+		// 0 是"答了但没判出层次"，是真数据；"没打成"必须是 NULL。
+		// 把没打成写成 0，等于往库里塞一条"这人一层都没讲到"的假事实。
+		{"depth_reached", `ALTER TABLE turn ADD COLUMN depth_reached INTEGER`},
+		{"suspect", `ALTER TABLE turn ADD COLUMN suspect TEXT NOT NULL DEFAULT ''`},
 	}
 	for _, a := range adds {
 		if s.hasColumn("turn", a.name) {
@@ -146,6 +153,8 @@ const schemaTurn = `CREATE TABLE IF NOT EXISTS turn (
 	weak       TEXT    NOT NULL DEFAULT '[]',
 	grade_err  TEXT    NOT NULL DEFAULT '',
 	grade_raw  TEXT    NOT NULL DEFAULT '',
+	depth_reached INTEGER,
+	suspect    TEXT    NOT NULL DEFAULT '',
 	updated_at TEXT    NOT NULL,
 	PRIMARY KEY (session_id, idx)
 )`
@@ -218,9 +227,10 @@ func (s *Store) SaveAnswer(sessionID string, idx int, answer string) error {
 // 不能像分数那样用 any 传 nil。
 func (s *Store) SaveGrade(sessionID string, idx int, g GradeState, sc *Score, rv *Review, errText, raw string) error {
 	// 用 any 是为了没分数时能真的写 NULL，而不是写 0。
-	var total, tier any
+	var total, tier, depth any
 	hits := "[]"
 	partial := 0
+	suspect := ""
 
 	if sc != nil {
 		total = sc.Total
@@ -233,6 +243,11 @@ func (s *Store) SaveGrade(sessionID string, idx int, g GradeState, sc *Score, rv
 		if sc.Partial {
 			partial = 1
 		}
+		// depth 只在真判过时才有值。sc 为 nil（没打成）时它保持 nil → 写 NULL，
+		// 和"判了但一层都没讲到（0）"分得清清楚楚。
+		// 这就是 store.go 开头那条规矩：失败不许伪装成 0 分。
+		depth = sc.Depth
+		suspect = sc.Suspect
 	}
 
 	comment, weak := "", "[]"
@@ -248,10 +263,12 @@ func (s *Store) SaveGrade(sessionID string, idx int, g GradeState, sc *Score, rv
 
 	_, err := s.db.Exec(
 		`UPDATE turn SET grade = ?, total = ?, tier = ?, hits = ?,
-		        partial = ?, comment = ?, weak = ?, grade_err = ?, grade_raw = ?, updated_at = ?
+		        partial = ?, comment = ?, weak = ?, grade_err = ?, grade_raw = ?,
+		        depth_reached = ?, suspect = ?, updated_at = ?
 		 WHERE session_id = ? AND idx = ?`,
 		string(g), total, tier, hits,
-		partial, comment, weak, errText, raw, nowText(), sessionID, idx)
+		partial, comment, weak, errText, raw,
+		depth, suspect, nowText(), sessionID, idx)
 	return err
 }
 
@@ -329,7 +346,8 @@ func (s *Store) LoadTurns(sessionID string) ([]Turn, error) {
 	rows, err := s.db.Query(
 		`SELECT idx, stage, question, answer, grade,
 		        total, tier, hits,
-		        partial, comment, weak, grade_err
+		        partial, comment, weak, grade_err,
+		        depth_reached, suspect
 		   FROM turn WHERE session_id = ? ORDER BY idx`, sessionID)
 	if err != nil {
 		return nil, err
@@ -345,10 +363,13 @@ func (s *Store) LoadTurns(sessionID string) ([]Turn, error) {
 			tier, hits              sql.NullString
 			partial                 int
 			comment, weak, gradeErr string
+			depthReached            sql.NullInt64
+			suspect                 string
 		)
 		if err := rows.Scan(&t.Index, &stage, &t.Question, &t.Answer, &t.Grade,
 			&total, &tier, &hits,
-			&partial, &comment, &weak, &gradeErr); err != nil {
+			&partial, &comment, &weak, &gradeErr,
+			&depthReached, &suspect); err != nil {
 			return nil, err
 		}
 		t.Stage = Stage(stage)
@@ -383,6 +404,13 @@ func (s *Store) LoadTurns(sessionID string) ([]Turn, error) {
 			if sc.Hits == nil {
 				sc.Hits = []string{}
 			}
+
+			// L2：老数据这两列是 NULL / 空串，读出来显示成"未判定"。
+			if depthReached.Valid {
+				sc.Depth = int(depthReached.Int64)
+			}
+			sc.Suspect = suspect
+
 			t.Score = sc
 		}
 		if comment != "" || weak != "[]" {

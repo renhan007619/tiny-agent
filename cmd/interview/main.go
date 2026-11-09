@@ -109,6 +109,18 @@ func main() {
 		}
 	}
 
+	// 开场定一次本场重点：读历史弱点，挑两个这次要重点问的。
+	//
+	// 只挑一次，之后每轮 Prompt 都带同一段——内容稳定，不破坏缓存。
+	// 库是空的（第一次用）就挑不出来，Prompt 自动走原来的分支，行为不变。
+	focus, focusErr := interview.PickFocus(store, 2, time.Now())
+	if focusErr != nil {
+		fmt.Fprintf(os.Stderr, "（读历史弱点失败，本场按常规出题：%v）\n", focusErr)
+	} else if len(focus) > 0 {
+		session.Focus = focus
+		fmt.Printf("本场重点 %d 个：%s\n", len(focus), interview.FocusTags(focus))
+	}
+
 	ctx := context.Background()
 
 	// 打分工厂现在就开工：你答一题，它就接一题，后台慢慢算。
