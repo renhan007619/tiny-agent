@@ -26,6 +26,13 @@ type Grader struct {
 	jobs    chan Turn      // 任务队列：交活的往里放，工人从里拿
 	pending sync.WaitGroup // 记着还有几件活没干完
 	closed  sync.Once
+
+	// onDone 打完一题时叫一声。nil 表示没人关心。
+	//
+	// 为什么是回调、而不是让打分器直接持有总线：
+	// 打分器不需要知道"总线"这个东西存在，它只需要知道"打完了要说一声"。
+	// 将来换成上报到别处、或者干脆不做，都不用改它。
+	onDone func(t Turn, sc *Score, errText string)
 }
 
 // NewGrader 建一个打分工厂。这时工人还没上班。
@@ -48,6 +55,22 @@ func (g *Grader) Start(ctx context.Context) {
 	for i := 0; i < g.workers; i++ {
 		go g.work(ctx)
 	}
+}
+
+// OnGrade 设置"打完一题通知谁"。必须在 Start 之前调。
+//
+// 为什么必须在前：工人一旦开工就可能立刻打完一题，
+// 那时候回调还是 nil，这一题的通知就丢了。
+func (g *Grader) OnGrade(fn func(t Turn, sc *Score, errText string)) {
+	g.onDone = fn
+}
+
+// notify 叫一声。没设回调就什么都不做。
+func (g *Grader) notify(t Turn, sc *Score, errText string) {
+	if g.onDone == nil {
+		return
+	}
+	g.onDone(t, sc, errText)
 }
 
 // work 是一个工人一辈子干的事：拿一件、干完、再拿下一件。
@@ -97,11 +120,13 @@ func (g *Grader) gradeOne(ctx context.Context, t Turn) {
 		// 外面喊停（进程要退、整场超时），就别再试了。
 		if ctx.Err() != nil {
 			g.write(t.Index, GradeFailed, nil, nil, "调用方取消", lastRaw)
+			g.notify(t, nil, "调用方取消")
 			return
 		}
 		// 第 2 次起先等一会儿再试，别对着抖动的服务连续砸。
 		if i > 1 && !sleepCtx(ctx, backoff(i)) {
 			g.write(t.Index, GradeFailed, nil, nil, "调用方取消", lastRaw)
+			g.notify(t, nil, "调用方取消")
 			return
 		}
 
@@ -141,11 +166,15 @@ func (g *Grader) gradeOne(ctx context.Context, t Turn) {
 		if review != nil {
 			g.recordWeakPoints(t.Index, review)
 		}
+
+		// 最后才通知。"打完了"这句话得等库写了、账记了才算数。
+		g.notify(t, score, "")
 		return
 	}
 
 	// 三次都没成：给它一个明确的死法，而不是留个空。
 	g.write(t.Index, GradeUnavailable, nil, nil, last, lastRaw)
+	g.notify(t, nil, last)
 }
 
 // recordWeakPoints 把这一题的弱点记进聚合表。

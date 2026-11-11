@@ -340,6 +340,29 @@ func (s *Store) LoadWeakPoints() ([]WeakStat, error) {
 	return out, rows.Err()
 }
 
+// LoadTurn 读一道题。
+//
+// 为什么需要它：事件里只带"第几题"，不带题目和答案。
+// 打分器收到便签后，凭 sessionID + idx 自己回来读这一题——
+// 库是唯一真相，事件里再带一份就有了第二份可能不一致的数据。
+//
+// 为什么用"读全部再挑"而不是写精确的 WHERE idx = ?：
+// 精确查询要把 LoadTurns 里那几十行 Scan（解析 hits / weak 的 JSON、
+// 拼回 Score）整个复制一遍，复制出来的第二份将来一定和第一份走偏。
+// 一场最多 30 行、SQLite 本地读，读全量的成本可以忽略。
+func (s *Store) LoadTurn(sessionID string, idx int) (Turn, error) {
+	turns, err := s.LoadTurns(sessionID)
+	if err != nil {
+		return Turn{}, err
+	}
+	for _, t := range turns {
+		if t.Index == idx {
+			return t, nil
+		}
+	}
+	return Turn{}, fmt.Errorf("场次 %s 里没有第 %d 题", sessionID, idx)
+}
+
 // LoadTurns 把一场面试的题全部读回来，按题号排好。
 // 报告用它，以后恢复面试也用它——看到的就是库里真实存着的。
 func (s *Store) LoadTurns(sessionID string) ([]Turn, error) {

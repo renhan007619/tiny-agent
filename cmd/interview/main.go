@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -125,7 +126,51 @@ func main() {
 
 	// 打分工厂现在就开工：你答一题，它就接一题，后台慢慢算。
 	grader := interview.NewGrader(chatter, store, tags, session.ID)
+
+	// 总线：从这一刻起 main 不再直接喊打分器，只贴便签。
+	//
+	// 先订阅再 Run，顺序不能反——反过来的话，最早那几张便签
+	// 可能在还没人听的时候就被消费掉了，而没人听的便签只会打一行日志就丢掉。
+	//
+	// 建在 grader.Start 之前：下面要给打分器装回调，回调里得用 bus。
+	bus := interview.NewBus()
+	bus.Subscribe(interview.NewEvaluator(grader, store))
+	bus.Subscribe(interview.NewLogger()) // 第二个订阅者：加它只动了这一行
+	go bus.Run(ctx)
+
+	// 打分器打完一题，叫我们一声；我们把这事儿贴到总线上。
+	//
+	// 为什么用回调、而不是让打分器直接持有总线：
+	// 打分器不需要知道"总线"这个东西存在，它只需要知道"打完了要说一声"。
+	// 将来换成上报到别处、或者干脆不说，都不用改它。
+	grader.OnGrade(func(t interview.Turn, sc *interview.Score, errText string) {
+		if sc != nil {
+			_ = bus.Publish(ctx, interview.Event{
+				Type:      interview.EvGradeDone,
+				SessionID: session.ID,
+				Idx:       t.Index,
+			})
+			return
+		}
+		_ = bus.Publish(ctx, interview.Event{
+			Type:      interview.EvGradeFailed,
+			SessionID: session.ID,
+			Idx:       t.Index,
+			Err:       errors.New(errText),
+		})
+	})
+
+	// Start 必须在装完回调之后：工人一开工就可能立刻打完一题，
+	// 那时候回调还是 nil，这一题的通知就丢了。
 	grader.Start(ctx)
+
+	// 开考：告诉所有人这一场开始了。放在第一题之前，顺序对得上。
+	if err := bus.Publish(ctx, interview.Event{
+		Type:      interview.EvSessionStarted,
+		SessionID: session.ID,
+	}); err != nil {
+		fmt.Fprintln(os.Stderr, "（开考通知没发出去：", err, "）")
+	}
 
 	// 接着面的话，把上次欠下的打分补上。
 	// 补的是"已经答过但没算分"的题，不是重新答题——所以不会漏东西。
@@ -135,7 +180,13 @@ func main() {
 			fmt.Fprintln(os.Stderr, "（查欠打分失败：", err, "）")
 		}
 		for _, t := range owe {
-			grader.Submit(t)
+			if err := bus.Publish(ctx, interview.Event{
+				Type:      interview.EvQuestionAnswered,
+				SessionID: session.ID,
+				Idx:       t.Index,
+			}); err != nil {
+				fmt.Fprintln(os.Stderr, "（补打分的通知没发出去：", err, "）")
+			}
 		}
 		if len(owe) > 0 {
 			fmt.Printf("补打 %d 道题的分数（后台算，不耽误你继续答）\n", len(owe))
@@ -168,6 +219,16 @@ func main() {
 			fmt.Fprintln(os.Stderr, "（存题失败：", err, "）")
 		}
 
+		// 出题：和"答完了"是两件事，题号用刚存进去那道题的 Index。
+		// 先落库再发，和答完那条一个规矩。
+		if err := bus.Publish(ctx, interview.Event{
+			Type:      interview.EvQuestionAsked,
+			SessionID: session.ID,
+			Idx:       last.Index,
+		}); err != nil {
+			fmt.Fprintln(os.Stderr, "（出题通知没发出去：", err, "）")
+		}
+
 		fmt.Print("\n你：")
 		if !scanner.Scan() {
 			break // Ctrl+Z 或 EOF
@@ -178,8 +239,17 @@ func main() {
 			fmt.Fprintln(os.Stderr, "（存答失败：", err, "）")
 		}
 
-		// 答完立刻交给打分工厂，不等它算完。
-		grader.Submit(session.Turns[len(session.Turns)-1])
+		// 答完贴一张便签，不等打分算完。
+		//
+		// 注意 SaveAnswer 必须在前：接收方是凭 sessionID + idx
+		// 回库里读这一题的，先落库它才读得到。
+		if err := bus.Publish(ctx, interview.Event{
+			Type:      interview.EvQuestionAnswered,
+			SessionID: session.ID,
+			Idx:       session.Total(),
+		}); err != nil {
+			fmt.Fprintln(os.Stderr, "（答完这一题的通知没发出去：", err, "）")
+		}
 	}
 
 	// 只有"题问够了"才算这场结束。
@@ -191,6 +261,15 @@ func main() {
 		if err := store.EndSession(session.ID, time.Now()); err != nil {
 			fmt.Fprintln(os.Stderr, "（收尾失败：", err, "）")
 		}
+
+		// 结束：先落库再通知，和前面几处一个规矩。
+		if err := bus.Publish(ctx, interview.Event{
+			Type:      interview.EvSessionFinished,
+			SessionID: session.ID,
+		}); err != nil {
+			fmt.Fprintln(os.Stderr, "（收尾通知没发出去：", err, "）")
+		}
+
 		fmt.Println()
 		fmt.Printf("面试结束（共 %d 题），等最后几题算完…\n", session.Total())
 	} else {
@@ -198,7 +277,22 @@ func main() {
 		fmt.Println("（这场没面完，已经存住了；下次启动可以接着面）")
 		fmt.Printf("已完成 %d 题，等已经交上去的打分算完…\n", session.Total())
 	}
+	// 三段，顺序不能反。
+	//
+	// 1. Drain：等"答完一题"的便签都变成打分任务。
+	//    少了这一步，还躺在 channel 里的便签永远没人处理，最后几题直接没分；
+	//    更糟的是 Handle 正往已关闭的队列里写，那是 panic。
+	// 2. Wait：等任务算完——这期间 worker 会冒出 grade.done / grade.failed。
+	// 3. Drain：再排空一次，把这批"打分结果"也处理掉。
+	//
+	// 【必记】一次排空只能等一批事件；在"等"的过程中产生的事件是第二批，得再等一次。
+	if err := bus.Drain(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, "（等总线排空超时：", err, "）")
+	}
 	grader.Wait()
+	if err := bus.Drain(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, "（等打分结果通知发完超时：", err, "）")
+	}
 
 	// 报告从库里重新读一遍再出——你看到的，就是下次打开还能看到的。
 	turns, err := store.LoadTurns(session.ID)

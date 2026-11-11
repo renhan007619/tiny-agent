@@ -21,7 +21,18 @@ const busBufferSize = 64
 type Bus struct {
 	ch   chan Event
 	subs map[EventType][]Agent
-	mu   sync.RWMutex // 护着 subs：注册和分发可能在不同 goroutine
+	mu   sync.RWMutex // 护着 subs 和 ack
+
+	// ack 是"挡板到了"的回执。
+	//
+	// Drain 塞挡板之前，先把一个 channel 存这儿；
+	// Run 处理到挡板时把它关掉，Drain 于是知道"前面的都处理完了"。
+	//
+	// 【必记】为什么非得要这个回执：
+	// 往 channel 里发送成功，只说明元素进了缓冲区，不代表有人取走。
+	// 没有回执，Drain 塞完挡板就得立刻返回——那等于什么都没等。
+	// 正向通道传"要处理的事"，反向通道传"处理完了"这一个信号，缺一不可。
+	ack chan struct{}
 }
 
 // NewBus 造一个公告栏。
@@ -75,6 +86,42 @@ func (b *Bus) Publish(ctx context.Context, ev Event) error {
 	}
 }
 
+// Drain 等"此刻之前发出去的便签"全部被处理完。退出前调一次。
+//
+// 做法：往同一条 channel 塞一张空白便签当挡板（Type 为空）。
+// Run 是单 goroutine FIFO 的，挡板一定排在之前所有便签后面，
+// 所以它被处理到的那一刻，前面的必然都处理完了。
+//
+// 【必记】挡板管"顺序"，ack 管"我知道它到了"，两个缺一不可：
+// b.ch <- Event{} 发送成功只代表挡板进了缓冲区，不代表 Run 取走了它。
+// 没有 ack，Drain 塞完就返回，等于什么都没等。
+//
+// 限制：用字段存 ack，所以同一时刻只能有一个 Drain 在等。
+// 只在退出前调一次，不要并发调用。
+func (b *Bus) Drain(ctx context.Context) error {
+	ack := make(chan struct{})
+	b.mu.Lock()
+	b.ack = ack
+	b.mu.Unlock()
+
+	select {
+	case b.ch <- Event{}: // Type 为空 = 挡板
+	case <-ctx.Done():
+		// 挡板没塞进去，把回执撤掉，免得下次 Drain 拿到个永远不会关的 channel。
+		b.mu.Lock()
+		b.ack = nil
+		b.mu.Unlock()
+		return ctx.Err()
+	}
+
+	select {
+	case <-ack:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // Run 开始分发。单 goroutine，一直跑到 ctx 取消。
 //
 // 【必记】单 goroutine 换来的是一件事：顺序。
@@ -95,6 +142,18 @@ func (b *Bus) Run(ctx context.Context) {
 
 // dispatch 把一张便签分给所有关心它的人。
 func (b *Bus) dispatch(ctx context.Context, ev Event) {
+	// 挡板：不是真事件，只用来告诉 Drain "排在我前面的都处理完了"。
+	// 它靠的是 Run 单 goroutine FIFO 这个性质，所以千万别把 Run 改成并发分发。
+	if ev.Type == "" {
+		b.mu.Lock()
+		if b.ack != nil {
+			close(b.ack)
+			b.ack = nil
+		}
+		b.mu.Unlock()
+		return
+	}
+
 	b.mu.RLock()
 	agents := b.subs[ev.Type]
 	b.mu.RUnlock()
