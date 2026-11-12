@@ -186,7 +186,7 @@ func (g *Grader) gradeOne(ctx context.Context, t Turn) {
 func (g *Grader) recordWeakPoints(idx int, review *Review) {
 	for _, w := range review.WeakPoints {
 		tag := g.tags.Resolve(w.Tag)
-		if err := g.store.UpsertWeakPoint(tag, w.Detail, w.Tag, g.sessionID, idx); err != nil {
+		if err := g.store.UpsertWeakPoint(tag, w.Detail, w.Tag, g.sessionID, idx, time.Now()); err != nil {
 			fmt.Fprintf(os.Stderr, "（第 %d 题弱点入库失败：%v）\n", idx, err)
 		}
 	}

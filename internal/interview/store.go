@@ -279,8 +279,13 @@ func (s *Store) SaveGrade(sessionID string, idx int, g GradeState, sc *Score, rv
 // 以前一句话一条的存法，同一个毛病换个说法就是两行，永远数不清。
 //
 // rawTag 是模型原本写的名字，原样存着；tag 是 Resolve 之后、库里一定有的名字。
-func (s *Store) UpsertWeakPoint(tag, detail, rawTag, sessionID string, idx int) error {
-	now := nowText()
+//
+// at 是"这件事什么时候发生的"，由调用方传，不在这里读 time.Now()。
+// 为什么：读真实时钟的代码没法测——排期是按 at 往后加 1/3/7 天的，
+// 如果这里自己取"现在"，测试就只能跟着系统时间走，跨天必挂。
+// 时间应该是参数，不是全局状态。
+func (s *Store) UpsertWeakPoint(tag, detail, rawTag, sessionID string, idx int, at time.Time) error {
+	now := at.Format(time.RFC3339)
 	_, err := s.db.Exec(
 		`INSERT INTO weak_point (tag, count, last_detail, last_raw_tag, last_session, last_idx, first_seen, last_seen)
 		 VALUES (?, 1, ?, ?, ?, ?, ?, ?)
@@ -301,7 +306,7 @@ func (s *Store) UpsertWeakPoint(tag, detail, rawTag, sessionID string, idx int) 
 	// 这里不包事务：万一账本记下了、排期没挂上，下次再犯同一个毛病会自动补上
 	// ——因为 StartReview 是幂等的（DO NOTHING）。
 	// 为一个能自愈的状态去加事务，属于把简单问题复杂化。
-	if err := s.StartReview(tag, time.Now()); err != nil {
+	if err := s.StartReview(tag, at); err != nil {
 		return err
 	}
 	return nil

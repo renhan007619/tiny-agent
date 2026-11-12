@@ -95,10 +95,10 @@ func TestCombineTier(t *testing.T) {
 		{"缺取舍+没量化", []string{"no_tradeoff", "no_number"}, TierC},
 		{"只报名词+没量化", []string{"name_only", "no_number"}, TierD}, // 2+1=3
 		{"缺取舍+缺边界+没量化", []string{"no_tradeoff", "no_boundary", "no_number"}, TierD},
-		{"答非所问", []string{"off_topic"}, TierD},                        // 3 格
-		{"答非所问+没量化", []string{"off_topic", "no_number"}, TierE},      // 3+1=4
-		{"核心概念说错", []string{"wrong_core"}, TierE},                    // 4 格，一步到 E
-		{"回答过短", []string{"too_short"}, TierE},                        // 4 格
+		{"答非所问", []string{"off_topic"}, TierD},                  // 3 格
+		{"答非所问+没量化", []string{"off_topic", "no_number"}, TierE}, // 3+1=4
+		{"核心概念说错", []string{"wrong_core"}, TierE},               // 4 格，一步到 E
+		{"回答过短", []string{"too_short"}, TierE},                  // 4 格
 		{"重复写同一项只算一次", []string{"no_tradeoff", "no_tradeoff"}, TierB},
 		{"不认识的项不影响档位", []string{"made_up"}, TierA},
 	}

@@ -175,9 +175,9 @@ func TestDueReviews_CarriesWeakDetail(t *testing.T) {
 	s := newTestStore(t)
 	now := testNow()
 
-	// UpsertWeakPoint 现在会自动挂排期
+	// UpsertWeakPoint 现在会自动挂排期，时间由调用方传（不能读真实时钟）
 	if err := s.UpsertWeakPoint("并发/channel 关闭与阻塞", "只说了要 close，没说谁 close",
-		"并发/channel 关闭与阻塞", "sess-1", 3); err != nil {
+		"并发/channel 关闭与阻塞", "sess-1", 3, now); err != nil {
 		t.Fatal(err)
 	}
 
